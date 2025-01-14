@@ -765,17 +765,41 @@ class ModelTesterMixin:
         Tests that the model supports batching and that the output is the nearly the same for the same input in
         different batch sizes.
         (Why "nearly the same" not "exactly the same"? Batching uses different matmul shapes, which often leads to
-        different results: https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535)
+        different results: https://github.com/huggingface/transformers/issues/25420#issuecomment-175317535)
         """
-
         def get_tensor_equivalence_function(batched_input):
             # models operating on continuous spaces have higher abs difference than LMs
             # instead, we can rely on cos distance for image/speech models, similar to `diffusers`
-            if "input_ids" not in batched_input:
-                return lambda tensor1, tensor2: (
-                    1.0 - F.cosine_similarity(tensor1.float().flatten(), tensor2.float().flatten(), dim=0, eps=1e-38)
-                )
-            return lambda tensor1, tensor2: torch.max(torch.abs(tensor1 - tensor2))
+            def foo(tensor1, tensor2):
+
+                _tensor1 = tensor1.masked_fill(torch.abs(tensor1 - tensor2) < 1e-9, 1.0)
+                _tensor2 = tensor2.masked_fill(torch.abs(tensor1 - tensor2) < 1e-9, 1.0)
+
+                normalized_1 = (_tensor1 / (_tensor1.masked_fill(_tensor1 == 0.0, 1.0)))
+                normalized_2 = (_tensor2 / (_tensor1.masked_fill(_tensor1 == 0.0, 1.0)))
+
+                # if < 1e-5 # considered 0.00001 v.s 0.00002 even if they are relative large
+                # if check relative   0.0001 v.s 0.00001 (10x large) but (10 v.s 1)
+                # 1e-7 + 1e-5 --> 1e-7 --> OK  (1 + 100 v.s 1)
+                # 1e-5 + 1e-5 --> v.s 1e-5 --> (1 + 1 v.s 1) ok
+                # 1e-5 + 1e-4 --> v.s 1e-5 --> not ok
+                # 1 + 1e-4 v.s 1 --> not ok
+                # 1 + 1e-5 v.s 1 --> OK
+                # 10 + 1e-4 v.s 10 --> 1 + 1e-5 v.s 1 ==> relative
+
+                # if "input_ids" not in batched_input:
+                #     return 1.0 - F.cosine_similarity(normalized_1.float().flatten(), normalized_2.float().flatten(), dim=0)
+                return torch.max(torch.abs(normalized_1 - normalized_2))
+            return foo
+
+        # def get_tensor_equivalence_function(batched_input):
+        #     # models operating on continuous spaces have higher abs difference than LMs
+        #     # instead, we can rely on cos distance for image/speech models, similar to `diffusers`
+        #     if "input_ids" not in batched_input:
+        #         return lambda tensor1, tensor2: (
+        #             1.0 - F.cosine_similarity(tensor1.float().flatten(), tensor2.float().flatten(), dim=0, eps=1e-38)
+        #         )
+        #     return lambda tensor1, tensor2: torch.max(torch.abs(tensor1 - tensor2))
 
         def recursive_check(batched_object, single_row_object, model_name, key):
             if isinstance(batched_object, (list, tuple)):
@@ -808,25 +832,44 @@ class ModelTesterMixin:
                 self.assertFalse(
                     torch.isinf(single_row_object).any(), f"Single row output has `inf` in {model_name} for key={key}"
                 )
-                self.assertTrue(
-                    (equivalence(batched_row, single_row_object)) <= 1e-03,
-                    msg=(
-                        f"Batched and Single row outputs are not equal in {model_name} for key={key}. "
-                        f"Difference={equivalence(batched_row, single_row_object)}."
-                    ),
-                )
+                a = torch.amax(torch.abs(batched_row))
+                b = torch.amax(torch.abs(single_row_object))
+                # if torch.is_floating_point(a) and torch.is_floating_point(b):
+                #     # if a < 1e-9 or b < 1e-9:
+                #     #     breakpoint()
+                #     #     raise ValueError("hello")
+                #     # breakpoint()
+                # return
+                # diff = equivalence(batched_row, single_row_object)
+                # if diff > 1e-03:
+                #     breakpoint()
+                # try:
+                torch.testing.assert_close(batched_row, single_row_object, atol=1e-7, rtol=1e-5)
+                # except:
+                #     breakpoint()
+                # self.assertTrue(
+                #     (equivalence(batched_row, single_row_object)) <= 1e-03,
+                #     msg=(
+                #         f"Batched and Single row outputs are not equal in {model_name} for key={key}. "
+                #         f"Difference={equivalence(batched_row, single_row_object)}."
+                #     ),
+                # )
 
         config, batched_input = self.model_tester.prepare_config_and_inputs_for_common()
         equivalence = get_tensor_equivalence_function(batched_input)
 
+        set_model_tester_for_less_flaky_test(self)
+
         for model_class in self.all_model_classes:
             config.output_hidden_states = True
+            set_config_for_less_flaky_test(config)
 
             model_name = model_class.__name__
             if hasattr(self.model_tester, "prepare_config_and_inputs_for_model_class"):
                 config, batched_input = self.model_tester.prepare_config_and_inputs_for_model_class(model_class)
             batched_input_prepared = self._prepare_for_class(batched_input, model_class)
             model = model_class(config).to(torch_device).eval()
+            set_model_for_less_flaky_test(model)
 
             batch_size = self.model_tester.batch_size
             single_row_input = {}
