@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Union
 
 import requests
 from get_ci_error_statistics import get_jobs
-from get_previous_daily_ci import get_last_daily_ci_reports
+from get_previous_daily_ci import get_last_daily_ci_reports, get_workflow_id
 from huggingface_hub import HfApi
 from slack_sdk import WebClient
 
@@ -922,11 +922,11 @@ def prepare_reports(title, header, reports, to_truncate=True):
 
 if __name__ == "__main__":
     SLACK_REPORT_CHANNEL_ID = os.environ["SLACK_REPORT_CHANNEL"]
+    RUN_ID = os.environ.get("RUN_ID")
     REPORT_REPO_ID = os.environ.get("REPORT_REPO_ID")
     if not REPORT_REPO_ID:
         REPORT_REPO_ID = "hf-internal-testing/transformers_daily_ci"
     UPLOAD_REPORT_SUMMARY = os.environ.get("UPLOAD_REPORT_SUMMARY") == "true"
-    WORKFLOW_ID = "90575235"
 
     # runner_status = os.environ.get("RUNNER_STATUS")
     # runner_env_status = os.environ.get("RUNNER_ENV_STATUS")
@@ -1275,6 +1275,9 @@ if __name__ == "__main__":
             artifact_names = [f"ci_results_{job_name}"]
             output_dir = os.path.join(os.getcwd(), "previous_reports")
             os.makedirs(output_dir, exist_ok=True)
+            workflow_id = None
+            if RUN_ID:
+                workflow_id = get_workflow_id(RUN_ID)
             prev_ci_artifacts = get_last_daily_ci_reports(
                 artifact_names=artifact_names, output_dir=output_dir, token=os.environ["ACCESS_REPO_INFO_TOKEN"], workflow_id=WORKFLOW_ID
             )

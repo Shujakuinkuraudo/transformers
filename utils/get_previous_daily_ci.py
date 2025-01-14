@@ -12,6 +12,22 @@ from get_ci_error_statistics import download_artifact, get_artifacts_links
 # and check the `workflow_id` key.
 DEFAULT_WORKFLOW_ID = "90575235"
 
+
+def get_workflow_id(token, run_id):
+    """Get the workflow id of the provided run"""
+
+    if run_id is None:
+        return DEFAULT_WORKFLOW_ID
+
+    headers = None
+    if token is not None:
+        headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}
+
+    url = f"https://api.github.com/repos/huggingface/transformers/actions/runs/{run_id}"
+    result = requests.get(url, headers=headers).json()
+
+    return result["workflow_id"]
+
 def get_daily_ci_runs(token, workflow_id = DEFAULT_WORKFLOW_ID, num_runs=7):
     """Get the workflow runs of the scheduled (daily) CI.
 
