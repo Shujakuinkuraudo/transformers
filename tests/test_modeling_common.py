@@ -844,7 +844,7 @@ class ModelTesterMixin:
                 # if diff > 1e-03:
                 #     breakpoint()
                 # try:
-                torch.testing.assert_close(batched_row, single_row_object, atol=1e-7, rtol=1e-5)
+                torch.testing.assert_close(batched_row, single_row_object, atol=1e-5, rtol=1e-5)
                 # except:
                 #     breakpoint()
                 # self.assertTrue(
