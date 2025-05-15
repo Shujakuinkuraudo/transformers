@@ -905,7 +905,7 @@ class TrainingArguments:
         metadata={"help": "If > 0: set total number of training steps to perform. Override num_train_epochs."},
     )
     lr_scheduler_type: Union[SchedulerType, str] = field(
-        default="linear",
+        default="cosine",
         metadata={"help": "The scheduler type to use."},
     )
     lr_scheduler_kwargs: Optional[Union[dict, str]] = field(
