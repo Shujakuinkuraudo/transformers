@@ -1989,7 +1989,7 @@ class Trainer:
             return smp.DistributedModel(model, backward_passes_per_step=self.args.gradient_accumulation_steps)
 
         # train/eval could be run multiple-times - if already wrapped, don't re-wrap it again
-        if self.accelerator.unwrap_model(model, keep_torch_compile=False) is not model:
+        if self.accelerator.unwrap_model(model) is not model:
             return model
 
         # Mixed precision training with apex
