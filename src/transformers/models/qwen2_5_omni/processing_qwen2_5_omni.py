@@ -231,6 +231,14 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
 
         processed_text = []
         for sample in text:
+            if isinstance(sample, list):
+                sample = " ".join(sample)
+            elif isinstance(sample, str):
+                sample = sample
+            else:
+                # Handle unexpected type if necessary, or raise an error
+                raise TypeError(f"Expected string or list of strings, got {type(sample)}")
+
             positions = []
             special_tokens = [re.escape(tok) for tok in [self.audio_token, self.image_token, self.video_token]]
             pattern = "|".join(special_tokens)

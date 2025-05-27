@@ -4278,6 +4278,9 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             self.enable_talker()
         self.post_init()
 
+    def get_input_embeddings(self):
+        return self.thinker.get_input_embeddings()
+
     def enable_talker(self):
         self.talker = Qwen2_5OmniTalkerForConditionalGeneration(self.config.talker_config)
         self.token2wav = Qwen2_5OmniToken2WavModel(self.config.token2wav_config)
