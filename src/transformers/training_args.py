@@ -968,7 +968,7 @@ class TrainingArguments:
         metadata={"help": "The checkpoint save strategy to use."},
     )
     save_steps: float = field(
-        default=500,
+        default=1000,
         metadata={
             "help": (
                 "Save checkpoint every X updates steps. Should be an integer or a float in range `[0,1)`. "

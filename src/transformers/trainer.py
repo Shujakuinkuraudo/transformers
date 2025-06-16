@@ -997,6 +997,7 @@ class Trainer:
             )
 
         else:
+
             return RandomSampler(self.train_dataset)
 
     def get_train_dataloader(self) -> DataLoader:
@@ -5364,3 +5365,4 @@ class Trainer:
             len_dataloader,
             max_steps,
         )
+

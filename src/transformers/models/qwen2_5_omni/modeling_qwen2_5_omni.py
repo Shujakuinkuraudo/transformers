@@ -2453,6 +2453,15 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         return model_inputs
 
 
+class Qwen2_5OmniThinkerForConditionalGeneration_for_hidellava(Qwen2_5OmniThinkerForConditionalGeneration):
+    """
+    Alias for backward compatibility.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        pass
+
+
 ############################
 #       Start Talker       #
 ############################
@@ -4331,7 +4340,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             **kwargs,
         )
         spk_path = cached_file(
-            pretrained_model_name_or_path,
+            "Qwen/Qwen2.5-Omni-3B",
             "spk_dict.pt",
             subfolder=kwargs.pop("subfolder", None),
             cache_dir=kwargs.pop("cache_dir", None),
@@ -4573,6 +4582,13 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         )
 
         return thinker_result.sequences, wav.float()
+    
+    @auto_docstring
+    def forward(self,*args,**kwargs):
+        kwargs.pop("num_items_in_batch", None)
+        return self.thinker.forward(*args, **kwargs)
+
+
 
 
 __all__ = [
