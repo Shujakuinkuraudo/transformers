@@ -2479,7 +2479,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        if (input_ids is None) and (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
@@ -2549,7 +2549,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
-                    task_ids=task_ids,  # BC for task_ids
+                    task_ids=task_ids,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -2561,7 +2561,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    task_ids=task_ids,  # BC for task_ids
+                    task_ids=task_ids,
                 )
 
             hidden_states = layer_outputs[0]
@@ -3024,6 +3024,39 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
+        loss_ae = None
+        if hasattr(self, "dmole_router"):
+            if inputs_embeds.size(1) == 1:
+                task_ids = self.dmole_router.get_latest_task_ids()
+            else:
+                vision_mask = input_ids == 151655
+                llm_mask = (input_ids != 151655) & (input_ids != 151643)
+
+                # v_pool, w_pool 分别为vision特征和llm特征的max pool
+                v_pool = []
+                w_pool = []
+                for sample_id in range(inputs_embeds.size(0)):
+                    v_pool.append(
+                        torch.max(
+                            inputs_embeds[sample_id][vision_mask[sample_id]], dim=0
+                        ).values
+                    )
+                    w_pool.append(
+                        torch.max(
+                            inputs_embeds[sample_id][llm_mask[sample_id]], dim=0
+                        ).values
+                    )
+                v_pool = torch.stack(v_pool, dim=0)
+                w_pool = torch.stack(w_pool, dim=0)
+                z = torch.cat([v_pool, w_pool], dim=1)
+                self.dmole_router: DMOLE_AE_router
+                if task_ids is not None:
+                    from peft.tuners.d_mole.layer import DMOLE_AE_router
+
+                    loss_ae = self.dmole_router(z, task_ids=task_ids)
+                else:
+                    task_ids = self.dmole_router(z)
+
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -3035,6 +3068,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             return_dict=return_dict,
             cache_position=cache_position,
             task_ids=task_ids,  # BC for task_ids
+            input_ids=input_ids,
         )
 
         hidden_states = outputs[0]
@@ -3047,6 +3081,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 labels=labels,
                 vocab_size=self.config.get_text_config().vocab_size,
             )
+            if hasattr(self, "dmole_router") and loss_ae is not None:
+                print(loss, loss_ae)
+                loss = loss + loss_ae
 
         if not return_dict:
             output = (logits,) + outputs
@@ -3060,6 +3097,14 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
         )
+
+    def add_model(self, model_name, model):
+        """
+        Add a model to the Thinker model. This is used for adding additional models like Hidellava.
+        """
+        if hasattr(self, model_name):
+            raise ValueError(f"Model {model_name} already exists in Thinker model.")
+        setattr(self, model_name, model)
 
     def prepare_inputs_for_generation(
         self,
@@ -3106,18 +3151,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             model_inputs["pixel_values_videos"] = None
 
         return model_inputs
-
-
-class Qwen2_5OmniThinkerForConditionalGeneration_for_hidellava(
-    Qwen2_5OmniThinkerForConditionalGeneration
-):
-    """
-    Alias for backward compatibility.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        pass
 
 
 ############################
@@ -5545,6 +5578,18 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
     def forward(self, *args, **kwargs):
         kwargs.pop("num_items_in_batch", None)
         return self.thinker.forward(*args, **kwargs)
+
+    def add_model(self, model_name, model):
+        """
+        Add a new model to the Qwen2.5OmniForConditionalGeneration instance.
+
+        Args:
+            model_name (str): The name of the model to be added.
+            model (nn.Module): The model instance to be added.
+        """
+        if hasattr(self, model_name):
+            raise ValueError(f"Model {model_name} already exists in this instance.")
+        self.thinker.add_model(model_name, model)
 
 
 __all__ = [
