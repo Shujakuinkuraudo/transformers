@@ -2394,7 +2394,7 @@ class Trainer:
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
                 deepspeed_load_checkpoint(
-                    self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model)
+                    self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model),
                 )
             elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
@@ -3192,6 +3192,8 @@ class Trainer:
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Save model checkpoint
+        if self.stage == "DMOLE_BEFORE_TRAIN":
+            return 
         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
 
         if self.hp_search_backend is None and trial is None:
@@ -3354,7 +3356,7 @@ class Trainer:
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         """If optimizer and scheduler states exist, load them."""
-        if checkpoint is None:
+        if checkpoint is None or self.stage in ["DMOLE_BEFORE_TRAIN", "DMOLE_TRAIN"]:
             return
 
         if self.is_deepspeed_enabled:
@@ -3489,7 +3491,7 @@ class Trainer:
 
     def _load_scaler(self, checkpoint):
         """If scaler state exists, load it."""
-        if checkpoint is None:
+        if checkpoint is None or self.stage in ["DMOLE_BEFORE_TRAIN", "DMOLE_TRAIN"]:
             return
 
         checkpoint_file_exists = os.path.isfile(os.path.join(checkpoint, SCALER_NAME))
@@ -5365,4 +5367,3 @@ class Trainer:
             len_dataloader,
             max_steps,
         )
-

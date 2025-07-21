@@ -3025,37 +3025,54 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         loss_ae = None
+        print("BEFORE_INTO_DMOLEROUTER", flush=True)
         if hasattr(self, "dmole_router"):
+            print("INTO_DMOLEROUTER", flush=True)
             if inputs_embeds.size(1) == 1:
                 task_ids = self.dmole_router.get_latest_task_ids()
             else:
-                vision_mask = input_ids == 151655
-                llm_mask = (input_ids != 151655) & (input_ids != 151643)
+                llm_mask = (
+                    (input_ids != 151655)
+                    & (input_ids != 151643)
+                    & (input_ids != 151646)
+                )
 
-                # v_pool, w_pool 分别为vision特征和llm特征的max pool
-                v_pool = []
-                w_pool = []
+                vision_mask = input_ids == 151655
+                audio_mask = input_ids == 151646
+
+                # v_pool, a_pool, w_pool 分别为vision特征、audio特征和llm特征的max pool
+                pooled_features = []
                 for sample_id in range(inputs_embeds.size(0)):
-                    v_pool.append(
-                        torch.max(
+                    sample_features = []
+
+                    # 检查是否存在vision特征
+                    if vision_mask[sample_id].any():
+                        v_pool = torch.max(
                             inputs_embeds[sample_id][vision_mask[sample_id]], dim=0
                         ).values
-                    )
-                    w_pool.append(
-                        torch.max(
+                        sample_features.append(v_pool)
+
+                    # 检查是否存在audio特征
+                    if audio_mask[sample_id].any():
+                        a_pool = torch.max(
+                            inputs_embeds[sample_id][audio_mask[sample_id]], dim=0
+                        ).values
+                        sample_features.append(a_pool)
+
+                    # 检查是否存在llm特征
+                    if llm_mask[sample_id].any():
+                        w_pool = torch.max(
                             inputs_embeds[sample_id][llm_mask[sample_id]], dim=0
                         ).values
-                    )
-                v_pool = torch.stack(v_pool, dim=0)
-                w_pool = torch.stack(w_pool, dim=0)
-                z = torch.cat([v_pool, w_pool], dim=1)
-                self.dmole_router: DMOLE_AE_router
-                if task_ids is not None:
-                    from peft.tuners.d_mole.layer import DMOLE_AE_router
+                        sample_features.append(w_pool)
 
-                    loss_ae = self.dmole_router(z, task_ids=task_ids)
-                else:
-                    task_ids = self.dmole_router(z)
+                    # 使用add操作组合特征
+                    z_sample = sum(sample_features) / len(sample_features)
+
+                    pooled_features.append(z_sample)
+
+                z = torch.stack(pooled_features, dim=0)
+                task_ids, loss_ae = self.dmole_router(z, task_ids=task_ids)
 
         outputs = self.model(
             attention_mask=attention_mask,
