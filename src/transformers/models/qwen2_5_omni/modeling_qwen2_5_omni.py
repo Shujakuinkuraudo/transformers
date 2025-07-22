@@ -3025,7 +3025,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         loss_ae = None
-        print("BEFORE_INTO_DMOLEROUTER", flush=True)
         if hasattr(self, "dmole_router"):
             print("INTO_DMOLEROUTER", flush=True)
             if inputs_embeds.size(1) == 1:
