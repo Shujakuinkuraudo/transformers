@@ -1147,7 +1147,7 @@ class TrainingArguments:
         },
     )
     dataloader_num_workers: int = field(
-        default=0,
+        default=5,
         metadata={
             "help": (
                 "Number of subprocesses to use for data loading (PyTorch only). 0 means that the data will be loaded"
@@ -1156,7 +1156,7 @@ class TrainingArguments:
         },
     )
     dataloader_prefetch_factor: Optional[int] = field(
-        default=None,
+        default=4,
         metadata={
             "help": (
                 "Number of batches loaded in advance by each worker. "
@@ -1324,7 +1324,7 @@ class TrainingArguments:
         default=True, metadata={"help": "Whether or not to pin memory for DataLoader."}
     )
     dataloader_persistent_workers: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": "If True, the data loader will not shut down the worker processes after a dataset has been consumed once. This allows to maintain the workers Dataset instances alive. Can potentially speed up training, but will increase RAM usage."
         },
