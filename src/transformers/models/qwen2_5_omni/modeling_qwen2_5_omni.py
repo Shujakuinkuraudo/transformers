@@ -1214,6 +1214,7 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
         feature_lens=None,
         aftercnn_lens=None,
         task_ids=None,
+        original_hashs=None,
     ):
         r"""
         input_features (`torch.LongTensor` of shape `(batch_size, feature_size, sequence_length)`):
@@ -1260,6 +1261,23 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             )
         ).to(torch.int32)
 
+        import os
+
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            hidden_states_dict = [{} for _ in range(len(aftercnn_lens))]
+            for i in range(len(aftercnn_lens)):
+                accumulated_len = aftercnn_lens[:i].sum()
+
+                hidden_states_dict[i][0] = (
+                    hidden_states[accumulated_len : accumulated_len + aftercnn_lens[i]]
+                    .clone()
+                    .detach()
+                    .cpu()
+                )
+
+        # print(hidden_states.shape, f"{feature_lens=}, {aftercnn_lens=}, {feature_lens.shape=}, {aftercnn_lens.shape=}")
+        # torch.Size([935, 1280]) feature_lens=tensor([1038,  832], device='cuda:1'), aftercnn_lens=tensor([519, 416], device='cuda:1'), feature_lens.shape=torch.Size([2]), aftercnn_lens.shape=torch.Size([2])
+
         for idx, encoder_layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -1277,15 +1295,58 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if os.environ.get("GET_FEATURE", "0") == "1":
+                for i in range(len(aftercnn_lens)):
+                    accumulated_len = aftercnn_lens[:i].sum()
+                    if idx % 5 == 0:
+                        hidden_states_dict[i][idx + 1] = (
+                            layer_outputs[0][
+                                accumulated_len : accumulated_len + aftercnn_lens[i]
+                            ]
+                            .clone()
+                            .detach()
+                            .cpu()
+                        )
+
         hidden_states_list = hidden_states.split(aftercnn_lens.tolist(), dim=0)
         token_audio_list = []
-        for each_audio_states in hidden_states_list:
+        for i, each_audio_states in enumerate(hidden_states_list):
             each_audio_states = self.avg_pooler(
                 each_audio_states.transpose(0, 1)
             ).transpose_(0, 1)
+            # print("Audio feature shape after avg pooler:", each_audio_states.shape)
+            # Audio feature shape after avg pooler: torch.Size([329, 1280])
             each_audio_states = self.ln_post(each_audio_states)
+            # print("Audio feature shape before proj:", each_audio_states.shape)
+            # Audio feature shape before proj: torch.Size([329, 1280])
             each_audio_states = self.proj(each_audio_states, task_ids=task_ids)
+            # print("Audio feature shape after proj:", each_audio_states.shape)
+            # Audio feature shape after proj: torch.Size([329, 2048])
             token_audio_list.append(each_audio_states)
+
+            if os.environ.get("GET_FEATURE", "0") == "1":
+                hidden_states_dict[i]["final"] = (
+                    each_audio_states.clone().detach().cpu()
+                )
+                output_dict = {}
+                output_dict["features"] = hidden_states_dict[i]
+                output_dict["padding_mask"] = padded_mask[i]
+                output_dict["original_hash"] = (
+                    original_hashs[i].cpu() if original_hashs is not None else None
+                )
+                output_dict["feature_len"] = feature_lens[i].cpu()
+                output_dict["aftercnn_len"] = aftercnn_lens[i].cpu()
+                import os, pickle
+
+                os.makedirs(
+                    f"features/{task_ids[i]}/{original_hashs[i]}", exist_ok=True
+                )
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/audio.pkl",
+                    "wb",
+                ) as f:
+                    pickle.dump(output_dict, f)
+
         token_audio = torch.cat(token_audio_list, dim=0)
         return BaseModelOutput(last_hidden_state=token_audio)
 
@@ -1757,11 +1818,14 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
 
         return window_index, cu_window_seqlens
 
+    from jaxtyping import Float
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
         task_ids: Optional[torch.Tensor] = None,
+        original_hashs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1808,6 +1872,21 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
+        import os
+
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            visual_feature_dict = [{} for _ in range(len(grid_thw) + 1)]
+
+            accumulate_size = [torch.prod(grid_thw[i, :]) for i in range(len(grid_thw))]
+            for i in range(len(grid_thw)):
+                end_idx = torch.cumsum(torch.tensor(accumulate_size), dim=0)[i]
+                visual_feature_dict[i][0] = (
+                    hidden_states[end_idx - accumulate_size[i] : end_idx]
+                    .clone()
+                    .detach()
+                    .cpu()
+                )
+
         # Modification here
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
@@ -1829,9 +1908,64 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
                     rotary_pos_emb=rotary_pos_emb,
                     task_ids=task_ids,
                 )
+
+            if os.environ.get("GET_FEATURE", "0") == "1":
+                for i in range(len(grid_thw)):
+                    if layer_num % 5 == 0:
+                        end_idx = torch.cumsum(torch.tensor(accumulate_size), dim=0)[i]
+                        visual_feature_dict[i][layer_num + 1] = (
+                            hidden_states[end_idx - accumulate_size[i] : end_idx]
+                            .clone()
+                            .detach()
+                            .cpu()
+                        )
+            # 1 torch.Size([104, 1280]) tensor([ 243166717186977984, 1270169655493953280], device='cuda:0') tensor([[ 1,  4, 20],[ 1,  2, 12]], device='cuda:0') torch.Size([2, 3])
         hidden_states = self.merger(hidden_states, task_ids=task_ids)
+
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            for i in range(len(grid_thw)):
+                end_idx = (
+                    torch.cumsum(torch.tensor(accumulate_size), dim=0)[i]
+                    // self.spatial_merge_unit
+                )
+                visual_feature_dict[i]["merger"] = (
+                    hidden_states[
+                        end_idx
+                        - accumulate_size[i] // self.spatial_merge_unit : end_idx
+                    ]
+                    .clone()
+                    .detach()
+                    .cpu()
+                )
+
+                output_dict = {}
+                output_dict["features"] = visual_feature_dict[i]
+                output_dict["original_hash"] = (
+                    original_hashs[i].cpu() if original_hashs is not None else None
+                )
+                output_dict["grid_thw"] = grid_thw[i].cpu()
+                import pickle, os
+
+                os.makedirs(
+                    f"features/{task_ids[i]}/{original_hashs[i]}", exist_ok=True
+                )
+
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/visual.pkl",
+                    "wb",
+                ) as f:
+                    pickle.dump(output_dict, f)
+                    # original_hash <class 'torch.Tensor'> torch.Size([])
+                    # grid_thw <class 'torch.Tensor'> torch.Size([3])
+                    #    0 <class 'torch.Tensor'> torch.Size([1680, 1280])
+                    #    1 <class 'torch.Tensor'> torch.Size([1680, 1280])
+                    #    ......
+                    #    32 <class 'torch.Tensor'> torch.Size([1680, 1280])
+                    #    merger <class 'torch.Tensor'> torch.Size([420, 2048]
+
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
+        # print("final", hidden_states.shape, original_hashs, grid_thw, grid_thw.shape, flush=True)
 
         return hidden_states
 
@@ -2832,6 +2966,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         cache_position: Optional[torch.LongTensor] = None,
         video_second_per_grid: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.Tensor] = None,
+        original_hashs: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, Qwen2_5OmniThinkerCausalLMOutputWithPast]:
         r"""
         input_features (`torch.FloatTensor` of shape `(batch_size, feature_size, feature_sequence_length)`):
@@ -2969,11 +3104,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     if audio_feature_lengths is not None
                     else feature_attention_mask.sum(-1)
                 )
-                audio_outputs = self.audio_tower(
+                audio_outputs = self.audio_tower.forward(
                     input_features,
                     feature_lens=feature_lens,
                     aftercnn_lens=audio_feat_lengths,
                     task_ids=task_ids,  # BC for task_ids
+                    original_hashs=original_hashs,
                 )
                 audio_features = audio_outputs.last_hidden_state
                 if audio_features.shape[0] != sum(audio_output_lengths.tolist()):
@@ -2993,8 +3129,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(
-                    pixel_values, grid_thw=image_grid_thw, task_ids=task_ids
+                image_embeds = self.visual.forward(
+                    pixel_values,
+                    grid_thw=image_grid_thw,
+                    task_ids=task_ids,
+                    original_hashs=original_hashs,
                 )
                 image_mask = (
                     (input_ids == self.config.image_token_id)
@@ -3008,8 +3147,14 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
+                print("pixel_values_videos", pixel_values_videos.shape)
                 pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                video_embeds = self.visual.forward(
+                    pixel_values_videos,
+                    grid_thw=video_grid_thw,
+                    original_hashs=original_hashs,
+                    task_ids=task_ids,
+                )
                 video_mask = (
                     (input_ids == self.config.video_token_id)
                     .unsqueeze(-1)
@@ -3025,6 +3170,51 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         loss_ae = None
+        # if hasattr(self, "feature"):
+        #     llm_mask = (
+        #         (input_ids != 151655)
+        #         & (input_ids != 151643)
+        #         & (input_ids != 151646)
+        #         & (input_ids != 151652)
+        #     )
+
+        #     image_mask = input_ids == 151655
+        #     audio_mask = input_ids == 151646
+        #     video_mask = input_ids == 151652
+
+        #     # v_pool, a_pool, w_pool 分别为vision特征、audio特征和llm特征的max pool
+        #     pooled_features = []
+        #     for sample_id in range(inputs_embeds.size(0)):
+        #         sample_features = []
+
+        #         # 检查是否存在vision特征
+        #         if image_mask[sample_id].any():
+        #             v_pool = torch.max(
+        #                 inputs_embeds[sample_id][image_mask[sample_id]], dim=0
+        #             ).values
+        #             sample_features.append(v_pool)
+
+        #         # 检查是否存在audio特征
+        #         if audio_mask[sample_id].any():
+        #             a_pool = torch.max(
+        #                 inputs_embeds[sample_id][audio_mask[sample_id]], dim=0
+        #             ).values
+        #             sample_features.append(a_pool)
+
+        #         # 检查是否存在llm特征
+        #         if llm_mask[sample_id].any():
+        #             w_pool = torch.max(
+        #                 inputs_embeds[sample_id][llm_mask[sample_id]], dim=0
+        #             ).values
+        #             sample_features.append(w_pool)
+
+        #         # 使用add操作组合特征
+        #         z_sample = sum(sample_features) / len(sample_features)
+
+        #         pooled_features.append(z_sample)
+
+        #     z = torch.stack(pooled_features, dim=0)
+
         if hasattr(self, "dmole_router"):
             print("INTO_DMOLEROUTER", flush=True)
             if inputs_embeds.size(1) == 1:
@@ -3034,10 +3224,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     (input_ids != 151655)
                     & (input_ids != 151643)
                     & (input_ids != 151646)
+                    & (input_ids != 151652)
                 )
 
-                vision_mask = input_ids == 151655
+                image_mask = input_ids == 151655
                 audio_mask = input_ids == 151646
+                video_mask = input_ids == 151652
 
                 # v_pool, a_pool, w_pool 分别为vision特征、audio特征和llm特征的max pool
                 pooled_features = []
@@ -3045,9 +3237,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                     sample_features = []
 
                     # 检查是否存在vision特征
-                    if vision_mask[sample_id].any():
+                    if image_mask[sample_id].any():
                         v_pool = torch.max(
-                            inputs_embeds[sample_id][vision_mask[sample_id]], dim=0
+                            inputs_embeds[sample_id][image_mask[sample_id]], dim=0
                         ).values
                         sample_features.append(v_pool)
 
@@ -3086,6 +3278,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             task_ids=task_ids,  # BC for task_ids
             input_ids=input_ids,
         )
+        print(outputs)
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)

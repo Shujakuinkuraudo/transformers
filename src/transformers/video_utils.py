@@ -701,7 +701,12 @@ def group_videos_by_shape(
         grouped_videos[shape].append(video)
         grouped_videos_index[i] = (shape, len(grouped_videos[shape]) - 1)
     # stack videos with the same shape
-    grouped_videos = {shape: torch.stack(videos, dim=0) for shape, videos in grouped_videos.items()}
+    try:
+        grouped_videos = {shape: torch.stack(videos, dim=0) for shape, videos in grouped_videos.items()}
+    except RuntimeError as e:
+        # RuntimeError: stack expects each tensor to be equal size, but got [14, 3, 252, 364] at entry 0 and [6, 3, 252, 364] at entry 1
+        grouped_videos = {shape: torch.concat(videos, dim=0)   for shape, videos in grouped_videos.items()}
+
     return grouped_videos, grouped_videos_index
 
 
