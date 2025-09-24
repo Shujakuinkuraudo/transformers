@@ -209,7 +209,7 @@ class Siglip2VisionEmbeddings(nn.Module):
         Args:
             pixel_values (`torch.FloatTensor`):
                 Pixel values of shape (batch_size, max_num_patches, num_channels * patch_size * patch_size)
-            spatial_shapes (`List[Tuple[int, int]]`):
+            spatial_shapes (`list[tuple[int, int]]`):
                 Spatial shapes of shape (batch_size, 2) to resize the positional embeddings to
         """
 
@@ -232,7 +232,7 @@ class Siglip2VisionEmbeddings(nn.Module):
 
 class Siglip2VisionTransformer(SiglipVisionTransformer):
     def __init__(self, config: Siglip2VisionConfig):
-        super().__init__()
+        super().__init__(config)
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
     # Update: add `spatial_shapes` and `attention_mask`

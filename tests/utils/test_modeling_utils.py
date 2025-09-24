@@ -27,6 +27,7 @@ import uuid
 import warnings
 from pathlib import Path
 
+import pytest
 import requests
 from huggingface_hub import HfApi, HfFolder
 from parameterized import parameterized
@@ -38,16 +39,27 @@ from transformers import (
     AutoModel,
     AutoModelForImageClassification,
     AutoModelForSequenceClassification,
+    BartConfig,
+    BartForConditionalGeneration,
     CLIPTextModelWithProjection,
     DynamicCache,
+    GPT2Config,
+    GPT2LMHeadModel,
+    LlavaConfig,
     LlavaForConditionalGeneration,
+    MistralConfig,
     MistralForCausalLM,
+    OPTConfig,
+    OPTForCausalLM,
     OwlViTForObjectDetection,
     PretrainedConfig,
+    T5Config,
+    T5ForConditionalGeneration,
     is_torch_available,
     logging,
 )
 from transformers.modeling_flash_attention_utils import is_flash_attn_available
+from transformers.models.mistral.modeling_mistral import MistralModel
 from transformers.testing_utils import (
     TOKEN,
     CaptureLogger,
@@ -57,14 +69,12 @@ from transformers.testing_utils import (
     hub_retry,
     is_staging_test,
     require_accelerate,
-    require_flax,
+    require_non_hpu,
     require_read_token,
     require_safetensors,
-    require_tf,
     require_torch,
     require_torch_accelerator,
     require_torch_multi_accelerator,
-    require_usr_bin_time,
     slow,
     torch_device,
 )
@@ -77,21 +87,20 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import (
     is_flash_attn_2_available,
-    is_flax_available,
-    is_tf_available,
+    is_flash_attn_3_available,
     is_torch_npu_available,
-    is_torch_sdpa_available,
 )
 
 
 sys.path.append(str(Path(__file__).parent.parent.parent / "utils"))
 
-from test_module.custom_configuration import CustomConfig, NoSuperInitConfig  # noqa E402
+from test_module.custom_configuration import CustomConfig
+
 
 if is_torch_available():
     import torch
     from safetensors.torch import save_file as safe_save_file
-    from test_module.custom_modeling import CustomModel, NoSuperInitModel
+    from test_module.custom_modeling import CustomModel
     from torch import nn
 
     from transformers import (
@@ -160,6 +169,38 @@ if is_torch_available():
 
         def forward(self, x):
             return self.linear2(self.linear(self.base(x)))
+
+    class ModelWithDirectParam(PreTrainedModel):
+        base_model_prefix = "base"
+        config_class = PretrainedConfig
+
+        def _init_weights(self, module):
+            pass
+
+        def __init__(self, config):
+            super().__init__(config)
+            # direct params and submodules is helpful for testing offloading logic
+            self.weight = nn.Parameter(torch.rand((5, 5)))
+            self.base = BaseModel(config)
+
+        def forward(self, x):
+            return self.base(x @ self.weight.T)
+
+    class ModelWithDirectParamSubmodule(PreTrainedModel):
+        base_model_prefix = "base"
+        config_class = PretrainedConfig
+
+        def _init_weights(self, module):
+            pass
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.submodule = ModelWithDirectParam(config)
+            # needed so model can have at least one module on accelerator
+            self.linear = nn.Linear(5, 5)
+
+        def forward(self, x):
+            return self.linear(self.submodule(x))
 
     class ModelWithHeadAndTiedWeights(PreTrainedModel):
         base_model_prefix = "base"
@@ -297,11 +338,25 @@ if is_torch_available():
                 hub.TRANSFORMERS_CACHE = transformers_cache
 
 
-if is_flax_available():
-    from transformers import FlaxBertModel
+# Need to be serializable, which means they cannot be in a test class method
+class TestGammaBetaNorm(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(torch.ones(1))
+        self.beta = torch.nn.Parameter(torch.zeros(1))
 
-if is_tf_available():
-    from transformers import TFBertModel
+    def forward(self):
+        return self.gamma.sum() + self.beta.sum()
+
+
+class TestModelGammaBeta(PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.LayerNorm = TestGammaBetaNorm()
+        self.post_init()
+
+    def forward(self):
+        return self.LayerNorm()
 
 
 TINY_T5 = "patrickvonplaten/t5-tiny-random"
@@ -459,9 +514,9 @@ class ModelUtilsTest(TestCasePlus):
         )
         self.assertIsNotNone(model)
 
-    def test_model_from_config_torch_dtype(self):
+    def test_model_from_config_dtype(self):
         # test that the model can be instantiated with dtype of user's choice - as long as it's a
-        # float dtype. To make it happen config.torch_dtype needs to be set before instantiating the
+        # float dtype. To make it happen config.dtype needs to be set before instantiating the
         # model from the config object.
 
         config = T5Config.from_pretrained(TINY_T5)
@@ -470,97 +525,97 @@ class ModelUtilsTest(TestCasePlus):
         # model = T5ForConditionalGeneration.from_config(config)
         self.assertEqual(model.dtype, torch.float32)
 
-        model = AutoModel.from_config(config, torch_dtype=torch.float16)
+        model = AutoModel.from_config(config, dtype=torch.float16)
         self.assertEqual(model.dtype, torch.float16)
 
         # torch.set_default_dtype() supports only float dtypes, so will fail with non-float type
         with self.assertRaises(ValueError):
-            model = AutoModel.from_config(config, torch_dtype=torch.int64)
+            model = AutoModel.from_config(config, dtype=torch.int64)
 
-    def test_model_from_config_torch_dtype_str(self):
-        # test that from_pretrained works with torch_dtype being strings like "float32" for PyTorch backend
-        model = AutoModel.from_pretrained(TINY_T5, torch_dtype="float32")
+    def test_model_from_config_dtype_str(self):
+        # test that from_pretrained works with dtype being strings like "float32" for PyTorch backend
+        model = AutoModel.from_pretrained(TINY_T5, dtype="float32")
         self.assertEqual(model.dtype, torch.float32)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
-        model = AutoModel.from_pretrained(TINY_T5, torch_dtype="float16")
+        model = AutoModel.from_pretrained(TINY_T5, dtype="float16")
         self.assertEqual(model.dtype, torch.float16)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
         # torch.set_default_dtype() supports only float dtypes, so will fail with non-float type
         with self.assertRaises(ValueError):
-            model = AutoModel.from_pretrained(TINY_T5, torch_dtype="int64")
+            model = AutoModel.from_pretrained(TINY_T5, dtype="int64")
 
-    def test_model_from_config_torch_dtype_composite(self):
+    def test_model_from_config_dtype_composite(self):
         """
-        Test that from_pretrained works with torch_dtype being as a dict per each sub-config in composite config
+        Test that from_pretrained works with dtype being as a dict per each sub-config in composite config
         Tiny-Llava has saved auto dtype as `torch.float32` for all modules.
         """
         # Load without dtype specified
         model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA)
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.float32)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
-        # should be able to set torch_dtype as a simple string and the model loads it correctly
-        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, torch_dtype="float32")
+        # should be able to set dtype as a simple string and the model loads it correctly
+        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, dtype="float32")
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.float32)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
-        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, torch_dtype=torch.float16)
+        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, dtype=torch.float16)
         self.assertEqual(model.language_model.dtype, torch.float16)
         self.assertEqual(model.vision_tower.dtype, torch.float16)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
-        # should be able to set torch_dtype as a dict for each sub-config
+        # should be able to set dtype as a dict for each sub-config
         model = LlavaForConditionalGeneration.from_pretrained(
-            TINY_LLAVA, torch_dtype={"text_config": "float32", "vision_config": "float16", "": "bfloat16"}
+            TINY_LLAVA, dtype={"text_config": "float32", "vision_config": "float16", "": "bfloat16"}
         )
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.float16)
         self.assertEqual(model.multi_modal_projector.linear_1.weight.dtype, torch.bfloat16)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
         # should be able to set the values as torch.dtype (not str)
         model = LlavaForConditionalGeneration.from_pretrained(
-            TINY_LLAVA, torch_dtype={"text_config": torch.float32, "vision_config": torch.float16, "": torch.bfloat16}
+            TINY_LLAVA, dtype={"text_config": torch.float32, "vision_config": torch.float16, "": torch.bfloat16}
         )
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.float16)
         self.assertEqual(model.multi_modal_projector.linear_1.weight.dtype, torch.bfloat16)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
         # should be able to set the values in configs directly and pass it to `from_pretrained`
         config = copy.deepcopy(model.config)
-        config.text_config.torch_dtype = torch.float32
-        config.vision_config.torch_dtype = torch.bfloat16
-        config.torch_dtype = torch.float16
-        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, config=config, torch_dtype="auto")
+        config.text_config.dtype = torch.float32
+        config.vision_config.dtype = torch.bfloat16
+        config.dtype = torch.float16
+        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, config=config, dtype="auto")
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.bfloat16)
         self.assertEqual(model.multi_modal_projector.linear_1.weight.dtype, torch.float16)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
         # but if the model has `_keep_in_fp32_modules` then those modules should be in fp32 no matter what
         LlavaForConditionalGeneration._keep_in_fp32_modules = ["multi_modal_projector"]
-        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, config=config, torch_dtype="auto")
+        model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, config=config, dtype="auto")
         self.assertEqual(model.language_model.dtype, torch.float32)
         self.assertEqual(model.vision_tower.dtype, torch.bfloat16)
         self.assertEqual(model.multi_modal_projector.linear_1.weight.dtype, torch.float32)
-        self.assertIsInstance(model.config.torch_dtype, torch.dtype)
+        self.assertIsInstance(model.config.dtype, torch.dtype)
 
         # torch.set_default_dtype() supports only float dtypes, so will fail with non-float type
         with self.assertRaises(ValueError):
-            model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, torch_dtype="int64")
+            model = LlavaForConditionalGeneration.from_pretrained(TINY_LLAVA, dtype="int64")
             model = LlavaForConditionalGeneration.from_pretrained(
-                TINY_LLAVA, torch_dtype={"text_config": "float32", "vision_config": "int64", "": "float16"}
+                TINY_LLAVA, dtype={"text_config": "float32", "vision_config": "int64", "": "float16"}
             )
 
-    def test_model_from_pretrained_torch_dtype(self):
+    def test_model_from_pretrained_dtype(self):
         # test that the model can be instantiated with dtype of either
-        # 1. explicit from_pretrained's torch_dtype argument
-        # 2. via autodiscovery by looking at model weights (torch_dtype="auto")
+        # 1. explicit from_pretrained's dtype argument
+        # 2. via autodiscovery by looking at model weights (dtype="auto")
         # so if a model.half() was saved, we want it to be instantiated as such.
         #
         # test an explicit model class, but also AutoModel separately as the latter goes through a different code path
@@ -570,11 +625,11 @@ class ModelUtilsTest(TestCasePlus):
         model = T5ForConditionalGeneration.from_pretrained(TINY_T5)
         self.assertEqual(model.dtype, torch.float32)
 
-        def remove_torch_dtype(model_path):
+        def remove_dtype(model_path):
             file = f"{model_path}/config.json"
             with open(file, encoding="utf-8") as f:
                 s = json.load(f)
-            s.pop("torch_dtype")
+            s.pop("dtype")
             with open(file, "w", encoding="utf-8") as f:
                 json.dump(s, f)
 
@@ -582,65 +637,65 @@ class ModelUtilsTest(TestCasePlus):
         model.save_pretrained(model_path)
         model = T5ForConditionalGeneration.from_pretrained(model_path)
         self.assertEqual(model.dtype, torch.float32)
-        # 1. test torch_dtype="auto" via `config.torch_dtype`
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+        # 1. test dtype="auto" via `config.dtype`
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype="auto")
         self.assertEqual(model.dtype, torch.float32)
-        # 2. test torch_dtype="auto" via auto-derivation
-        # now remove the torch_dtype entry from config.json and try "auto" again which should
+        # 2. test dtype="auto" via auto-derivation
+        # now remove the dtype entry from config.json and try "auto" again which should
         # perform auto-derivation from weights
-        remove_torch_dtype(model_path)
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+        remove_dtype(model_path)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype="auto")
         self.assertEqual(model.dtype, torch.float32)
 
         # test forced loading in fp16 (even though the weights are in fp32)
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch.float16)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype=torch.float16)
         self.assertEqual(model.dtype, torch.float16)
 
         # test fp16 save_pretrained, loaded with auto-detection
         model = model.half()
         model.save_pretrained(model_path)
-        # 1. test torch_dtype="auto" via `config.torch_dtype`
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
-        self.assertEqual(model.config.torch_dtype, torch.float16)
+        # 1. test dtype="auto" via `config.dtype`
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype="auto")
+        self.assertEqual(model.config.dtype, torch.float16)
         self.assertEqual(model.dtype, torch.float16)
-        # tests `config.torch_dtype` saving
+        # tests `config.dtype` saving
         with open(f"{model_path}/config.json") as f:
             config_dict = json.load(f)
-        self.assertEqual(config_dict["torch_dtype"], "float16")
-        # 2. test torch_dtype="auto" via auto-derivation
+        self.assertEqual(config_dict["dtype"], "float16")
+        # 2. test dtype="auto" via auto-derivation
         # now same with using config info
-        remove_torch_dtype(model_path)
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype="auto")
+        remove_dtype(model_path)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype="auto")
         self.assertEqual(model.dtype, torch.float16)
 
-        # 3. now retest that AutoModel behaves the same wrt torch_dtype="auto" as T5ForConditionalGeneration
-        model = AutoModel.from_pretrained(model_path, torch_dtype="auto")
+        # 3. now retest that AutoModel behaves the same wrt dtype="auto" as T5ForConditionalGeneration
+        model = AutoModel.from_pretrained(model_path, dtype="auto")
         self.assertEqual(model.dtype, torch.float16)
 
         # test fp16 save_pretrained, loaded with the explicit fp16
-        model = T5ForConditionalGeneration.from_pretrained(model_path, torch_dtype=torch.float16)
+        model = T5ForConditionalGeneration.from_pretrained(model_path, dtype=torch.float16)
         self.assertEqual(model.dtype, torch.float16)
 
         # test AutoModel separately as it goes through a different path
-        # test auto-detection - as currently TINY_T5 doesn't have torch_dtype entry
-        model = AutoModel.from_pretrained(TINY_T5, torch_dtype="auto")
-        # test that the config object didn't get polluted with torch_dtype="auto"
-        # there was a bug that after this call we ended up with config.torch_dtype=="auto"
-        self.assertNotEqual(model.config.torch_dtype, "auto")
+        # test auto-detection - as currently TINY_T5 doesn't have dtype entry
+        model = AutoModel.from_pretrained(TINY_T5, dtype="auto")
+        # test that the config object didn't get polluted with dtype="auto"
+        # there was a bug that after this call we ended up with config.dtype=="auto"
+        self.assertNotEqual(model.config.dtype, "auto")
         # now test the outcome
         self.assertEqual(model.dtype, torch.float32)
-        model = AutoModel.from_pretrained(TINY_T5, torch_dtype=torch.float16)
+        model = AutoModel.from_pretrained(TINY_T5, dtype=torch.float16)
         self.assertEqual(model.dtype, torch.float16)
 
         # test model whose first param is not of a floating type, but int
-        model = AutoModel.from_pretrained(TINY_BERT_FOR_TOKEN_CLASSIFICATION, torch_dtype="auto")
+        model = AutoModel.from_pretrained(TINY_BERT_FOR_TOKEN_CLASSIFICATION, dtype="auto")
         self.assertEqual(model.dtype, torch.float32)
 
         # test model that init the model with _from_config
         model = CLIPTextModelWithProjection.from_pretrained(
             "hf-internal-testing/diffusers-stable-diffusion-tiny-all",
             subfolder="text_encoder",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
         self.assertEqual(model.dtype, torch.bfloat16)
 
@@ -648,12 +703,13 @@ class ModelUtilsTest(TestCasePlus):
         # test that the model can be instantiated with attn_implementation of either
         # 1. explicit from_pretrained's attn_implementation argument
         # 2. explicit from_pretrained's attn_implementation argument with a config argument
-        attn_implementation_available = ["eager"]
-        if is_torch_sdpa_available():
-            attn_implementation_available.append("sdpa")
+        attn_implementation_available = ["eager", "sdpa"]
 
         if is_flash_attn_available():
             attn_implementation_available.append("flash_attention_2")
+
+        if is_flash_attn_3_available():
+            attn_implementation_available.append("flash_attention_3")
 
         for requested_attn_implementation in attn_implementation_available:
             model = AutoModelForCausalLM.from_pretrained(
@@ -672,46 +728,32 @@ class ModelUtilsTest(TestCasePlus):
         # 1. config created with explicit attn_implementatation and from_config
         # 2. explicit from_config's attn_implementation argument with a config argument
         # 3. config created with explicit attn_implementatation and from_config overriding with explicit attn_implementation argument
-        attn_implementation_available = ["eager"]
-        if is_torch_sdpa_available():
-            attn_implementation_available.append("sdpa")
+        attn_implementation_available = ["eager", "sdpa"]
 
         if is_flash_attn_available():
             attn_implementation_available.append("flash_attention_2")
+
+        if is_flash_attn_3_available():
+            attn_implementation_available.append("flash_attention_3")
 
         for requested_attn_implementation in attn_implementation_available:
             config = AutoConfig.from_pretrained(TINY_MISTRAL, attn_implementation=requested_attn_implementation)
             # Ensure the config was set correctly
             self.assertEqual(config._attn_implementation, requested_attn_implementation)
-            self.assertEqual(config._attn_implementation_internal, requested_attn_implementation)
             model = AutoModelForCausalLM.from_config(config)
             self.assertEqual(model.config._attn_implementation, requested_attn_implementation)
 
             config = AutoConfig.from_pretrained(TINY_MISTRAL)
             # When the config is not set, the default is "eager"
-            self.assertEqual(config._attn_implementation, "eager")
-            self.assertEqual(config._attn_implementation_internal, None)
+            self.assertEqual(config._attn_implementation, None)
             model = AutoModelForCausalLM.from_config(config=config, attn_implementation=requested_attn_implementation)
             self.assertEqual(model.config._attn_implementation, requested_attn_implementation)
 
             # Set a nonsense attn_implementation in the config, which should be overridden by the explicit argument
             config = AutoConfig.from_pretrained(TINY_MISTRAL, attn_implementation="foo-bar-baz")
             self.assertEqual(config._attn_implementation, "foo-bar-baz")
-            self.assertEqual(config._attn_implementation_internal, "foo-bar-baz")
             model = AutoModelForCausalLM.from_config(config=config, attn_implementation=requested_attn_implementation)
             self.assertEqual(model.config._attn_implementation, requested_attn_implementation)
-
-    def test_no_super_init_config_and_model(self):
-        config = NoSuperInitConfig(attribute=32)
-        model = NoSuperInitModel(config)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir)
-
-            new_model = NoSuperInitModel.from_pretrained(tmp_dir)
-
-        for p1, p2 in zip(model.parameters(), new_model.parameters()):
-            self.assertTrue(torch.equal(p1, p2))
 
     def test_checkpoint_sharding_local_bin(self):
         model = BertModel.from_pretrained("hf-internal-testing/tiny-random-bert")
@@ -982,57 +1024,7 @@ class ModelUtilsTest(TestCasePlus):
 
         self.assertIsNotNone(model)
 
-    @require_accelerate
-    @mark.accelerate_tests
-    def test_from_pretrained_low_cpu_mem_usage_functional(self):
-        # test that we can use `from_pretrained(..., low_cpu_mem_usage=True)` with normal and
-        # sharded models
-
-        mnames = [
-            "hf-internal-testing/tiny-random-bert-sharded",
-            "hf-internal-testing/tiny-random-bert",
-        ]
-        for mname in mnames:
-            _ = BertModel.from_pretrained(mname, low_cpu_mem_usage=True)
-
-    @slow
-    @require_usr_bin_time
-    @require_accelerate
-    @mark.accelerate_tests
-    def test_from_pretrained_low_cpu_mem_usage_equal(self):
-        # Before this would test that `from_pretrained(..., low_cpu_mem_usage=True)` uses less cpu memory than default
-        # Now though these should be around the same.
-        # TODO: Look for good bounds to check that their timings are near the same
-
-        mname = "HuggingFaceTB/SmolLM-135M"
-
-        preamble = "from transformers import AutoModel"
-        one_liner_str = f'{preamble}; AutoModel.from_pretrained("{mname}", low_cpu_mem_usage=False)'
-        # Save this output as `max_rss_normal` if testing memory results
-        max_rss_normal = self.python_one_liner_max_rss(one_liner_str)
-
-        one_liner_str = f'{preamble};  AutoModel.from_pretrained("{mname}", low_cpu_mem_usage=True)'
-        # Save this output as `max_rss_low_mem` if testing memory results
-        max_rss_low_mem = self.python_one_liner_max_rss(one_liner_str)
-
-        # Should be within 5MBs of each other (overhead)
-        self.assertAlmostEqual(
-            max_rss_normal / 1024 / 1024,
-            max_rss_low_mem / 1024 / 1024,
-            delta=5,
-            msg="using `low_cpu_mem_usage` should incur the same memory usage in both cases.",
-        )
-
-        # if you want to compare things manually, let's first look at the size of the model in bytes
-        # model = AutoModel.from_pretrained(mname, low_cpu_mem_usage=False)
-        # total_numel = sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values())
-        # total_bytes = total_numel * 4
-        # Now the diff_bytes should be very close to total_bytes, but the reports are inconsistent.
-        # The easiest way to test this is to switch the model and torch.load to do all the work on
-        # gpu - that way one can measure exactly the total and peak memory used. Perhaps once we add
-        # functionality to load models directly on gpu, this test can be rewritten to use torch's
-        # cuda memory tracking and then we should be able to do a much more precise test.
-
+    @require_non_hpu
     @require_accelerate
     @mark.accelerate_tests
     @require_torch_multi_accelerator
@@ -1219,6 +1211,42 @@ class ModelUtilsTest(TestCasePlus):
 
         torch.testing.assert_close(output, presaved_output, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(presaved_output, postsaved_output)
+
+    @require_accelerate
+    @mark.accelerate_tests
+    @require_torch_accelerator
+    def test_save_offloaded_model_with_direct_params(self):
+        from accelerate import dispatch_model
+
+        device_map = {"submodule": "cpu", "linear": f"{torch_device}:0"}
+        model = ModelWithDirectParamSubmodule(PretrainedConfig())
+        dispatch_model(model, device_map)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+
+    @require_accelerate
+    @mark.accelerate_tests
+    @require_torch_accelerator
+    def test_save_offloaded_model_dynamic_tied_weights_keys(self):
+        from accelerate import dispatch_model
+
+        device_map = {"base": f"{torch_device}:0", "linear": "cpu", "linear2": "cpu"}
+        model = ModelWithHead(PretrainedConfig())
+        dispatch_model(model, device_map)
+
+        transform_a = torch.nn.Linear(1, 1, bias=False)
+        transform_a._dynamic_tied_weights_keys = ["weight"]
+        transform_b = torch.nn.Linear(1, 1, bias=False)
+        transform_b._dynamic_tied_weights_keys = ["weight"]
+
+        model.linear.register_module("transform_a", transform_a)
+        model.linear.register_module("transform_b", transform_b)
+        model.linear2.register_module("transform_a", transform_a)
+        model.linear2.register_module("transform_b", transform_b)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
 
     @require_safetensors
     def test_use_safetensors(self):
@@ -1515,8 +1543,7 @@ class ModelUtilsTest(TestCasePlus):
                 pretrained_model_name_or_path=model_id,
                 config=model_config,
                 ignore_mismatched_sizes=True,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
+                dtype=torch.float16,
             )
             model_ref = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=model_id)
 
@@ -1544,40 +1571,6 @@ class ModelUtilsTest(TestCasePlus):
 
         for p1, p2 in zip(model.parameters(), new_model.parameters()):
             self.assertTrue(torch.equal(p1, p2))
-
-    @require_safetensors
-    @require_flax
-    def test_safetensors_torch_from_flax(self):
-        hub_model = BertModel.from_pretrained("hf-internal-testing/tiny-bert-pt-only")
-        model = FlaxBertModel.from_pretrained("hf-internal-testing/tiny-bert-flax-only")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir, safe_serialization=True)
-            new_model = BertModel.from_pretrained(tmp_dir)
-
-        for p1, p2 in zip(hub_model.parameters(), new_model.parameters()):
-            self.assertTrue(torch.equal(p1, p2))
-
-    @require_tf
-    @require_safetensors
-    def test_safetensors_torch_from_tf(self):
-        hub_model = BertModel.from_pretrained("hf-internal-testing/tiny-bert-pt-only")
-        model = TFBertModel.from_pretrained("hf-internal-testing/tiny-bert-tf-only")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir, safe_serialization=True)
-            new_model = BertModel.from_pretrained(tmp_dir)
-
-        for p1, p2 in zip(hub_model.parameters(), new_model.parameters()):
-            self.assertTrue(torch.equal(p1, p2))
-
-    @require_tf
-    def test_torch_from_tf(self):
-        model = TFBertModel.from_pretrained("hf-internal-testing/tiny-bert-tf-only")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir)
-            _ = BertModel.from_pretrained(tmp_dir, from_tf=True)
 
     @require_safetensors
     def test_safetensors_torch_from_torch_sharded(self):
@@ -1636,24 +1629,6 @@ class ModelUtilsTest(TestCasePlus):
             torch.testing.assert_close(outputs_from_saved["logits"], outputs["logits"])
 
     def test_warning_for_beta_gamma_parameters(self):
-        class TestGammaBetaNorm(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.gamma = torch.nn.Parameter(torch.ones(1))
-                self.beta = torch.nn.Parameter(torch.zeros(1))
-
-            def forward(self):
-                return self.gamma.sum() + self.beta.sum()
-
-        class TestModelGammaBeta(PreTrainedModel):
-            def __init__(self, config):
-                super().__init__(config)
-                self.LayerNorm = TestGammaBetaNorm()
-                self.post_init()
-
-            def forward(self):
-                return self.LayerNorm()
-
         logger = logging.get_logger("transformers.modeling_utils")
         config = PretrainedConfig()
         warning_msg_gamma = "`LayerNorm.gamma` -> `LayerNorm.weight`"
@@ -1779,16 +1754,6 @@ class ModelUtilsTest(TestCasePlus):
         )
         self.assertTrue(check_models_equal(model, model_loaded))
 
-    def test_load_model_with_state_dict_only_low_cpu_mem_usage(self):
-        model = BertModel.from_pretrained("hf-internal-testing/tiny-random-bert")
-        state_dict = model.state_dict()
-        config = model.config
-
-        model_loaded = BertModel.from_pretrained(
-            pretrained_model_name_or_path=None, config=config, state_dict=state_dict, low_cpu_mem_usage=True
-        )
-        self.assertTrue(check_models_equal(model, model_loaded))
-
     def test_cache_when_needed_at_train_time(self):
         """
         Some fine-tuning methods require the use of cache, like prefix tuning in PEFT. This test checks that a cache
@@ -1826,7 +1791,7 @@ class ModelUtilsTest(TestCasePlus):
         self.assertIsNone(model_outputs.past_key_values)
         self.assertTrue(model.training)
 
-    def test_restore_default_torch_dtype_from_pretrained(self):
+    def test_restore_default_dtype_from_pretrained(self):
         """
         Tests that the default torch dtype is restored
         when an error happens during the loading of a model.
@@ -1835,25 +1800,25 @@ class ModelUtilsTest(TestCasePlus):
         # set default type to float32
         torch.set_default_dtype(torch.float32)
 
-        # Mock injection point which is right after the call to `_set_default_torch_dtype`
-        original_set_default_torch_dtype = MistralForCausalLM._set_default_torch_dtype
+        # Mock injection point which is right after the call to `_set_default_dtype`
+        original_set_default_dtype = MistralForCausalLM._set_default_dtype
 
         def debug(*args, **kwargs):
             # call the method as usual, than raise a RuntimeError
-            original_set_default_torch_dtype(*args, **kwargs)
+            original_set_default_dtype(*args, **kwargs)
             raise RuntimeError
 
         with mock.patch(
-            "transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_torch_dtype",
+            "transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_dtype",
             side_effect=debug,
         ):
             with self.assertRaises(RuntimeError):
-                _ = AutoModelForCausalLM.from_pretrained(TINY_MISTRAL, device_map="auto", torch_dtype=torch.float16)
+                _ = AutoModelForCausalLM.from_pretrained(TINY_MISTRAL, device_map="auto", dtype=torch.float16)
         # default should still be float32
         assert torch.get_default_dtype() == torch.float32
         torch.set_default_dtype(old_dtype)
 
-    def test_restore_default_torch_dtype_from_config(self):
+    def test_restore_default_dtype_from_config(self):
         """
         Tests that the default torch dtype is restored
         when an error happens during the loading of a model.
@@ -1866,20 +1831,20 @@ class ModelUtilsTest(TestCasePlus):
             TINY_MISTRAL,
         )
 
-        # Mock injection point which is right after the call to `_set_default_torch_dtype`
-        original_set_default_torch_dtype = MistralForCausalLM._set_default_torch_dtype
+        # Mock injection point which is right after the call to `_set_default_dtype`
+        original_set_default_dtype = MistralForCausalLM._set_default_dtype
 
         def debug(*args, **kwargs):
             # call the method as usual, than raise a RuntimeError
-            original_set_default_torch_dtype(*args, **kwargs)
+            original_set_default_dtype(*args, **kwargs)
             raise RuntimeError
 
         with mock.patch(
-            "transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_torch_dtype",
+            "transformers.models.mistral.modeling_mistral.MistralForCausalLM._set_default_dtype",
             side_effect=debug,
         ):
             with self.assertRaises(RuntimeError):
-                config.torch_dtype = torch.float16
+                config.dtype = torch.float16
                 _ = AutoModelForCausalLM.from_config(
                     config,
                 )
@@ -1912,7 +1877,7 @@ class ModelUtilsTest(TestCasePlus):
         Note that we run this test in a subprocess, to ensure that cuda is not already initialized/warmed-up.
         """
         # First download the weights if not already on disk
-        _ = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+        _ = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16)
 
         script_to_run = textwrap.dedent(
             """
@@ -1933,7 +1898,7 @@ class ModelUtilsTest(TestCasePlus):
             torch_accelerator_module = getattr(torch, device_type, torch.cuda)
             torch_accelerator_module.synchronize(device)
             t0 = time.time()
-            model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=torch.float16, device_map=device)
+            model = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.float16, device_map=device)
             torch_accelerator_module.synchronize(device)
             dt = time.time() - t0
 
@@ -1957,6 +1922,111 @@ class ModelUtilsTest(TestCasePlus):
                 _ = subprocess.run(cmd, capture_output=True, env=self.get_env(), text=True, check=True, timeout=60)
             except subprocess.CalledProcessError as e:
                 raise Exception(f"The following error was captured: {e.stderr}")
+
+    def test_explicit_transformers_weights(self):
+        """
+        Transformers supports loading from repos where the weights file is explicitly set in the config.
+        When loading a config file, transformers will see whether `transformers_weights` is defined in the config.
+        If so, it will load from that file.
+
+        Here, we ensure that the correct file is loaded.
+        """
+        model = BertModel.from_pretrained("hf-internal-testing/explicit_transformers_weight_in_config")
+        self.assertEqual(model.num_parameters(), 87929)
+
+    def test_explicit_transformers_weights_index(self):
+        """
+        Transformers supports loading from repos where the weights file is explicitly set in the config.
+        When loading a config file, transformers will see whether `transformers_weights` is defined in the config.
+        If so, it will load from that file.
+
+        Here, we ensure that the correct file is loaded, given the file is an index of multiple weights.
+        """
+        model = BertModel.from_pretrained("hf-internal-testing/explicit_transformers_weight_in_config_sharded")
+        self.assertEqual(model.num_parameters(), 87929)
+
+    def test_explicit_transformers_weights_save_and_reload(self):
+        """
+        Transformers supports loading from repos where the weights file is explicitly set in the config.
+        When loading a config file, transformers will see whether `transformers_weights` is defined in the config.
+        If so, it will load from that file.
+
+        When saving the model, we should be careful not to safe the `transformers_weights` attribute in the config;
+        otherwise, transformers will try to load from that file whereas it should simply load from the default file.
+
+        We test that for a non-sharded repo.
+        """
+        model = BertModel.from_pretrained("hf-internal-testing/explicit_transformers_weight_in_config")
+        explicit_transformers_weights = model.config.transformers_weights
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname)
+
+            # The config should not have a mention of transformers_weights
+            with open(os.path.join(tmpdirname, "config.json")) as f:
+                config = json.loads(f.read())
+                self.assertFalse("transformers_weights" in config)
+
+            # The serialized weights should be in model.safetensors and not the transformers_weights
+            self.assertTrue(explicit_transformers_weights not in os.listdir(tmpdirname))
+            self.assertTrue("model.safetensors" in os.listdir(tmpdirname))
+
+    def test_explicit_transformers_weights_index_save_and_reload(self):
+        """
+        Transformers supports loading from repos where the weights file is explicitly set in the config.
+        When loading a config file, transformers will see whether `transformers_weights` is defined in the config.
+        If so, it will load from that file.
+
+        When saving the model, we should be careful not to safe the `transformers_weights` attribute in the config;
+        otherwise, transformers will try to load from that file whereas it should simply load from the default file.
+
+        We test that for a sharded repo.
+        """
+        model = BertModel.from_pretrained("hf-internal-testing/explicit_transformers_weight_in_config_sharded")
+        explicit_transformers_weights = model.config.transformers_weights
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname, max_shard_size="100kb")
+
+            # The config should not have a mention of transformers_weights
+            with open(os.path.join(tmpdirname, "config.json")) as f:
+                config = json.loads(f.read())
+                self.assertFalse("transformers_weights" in config)
+
+            # The serialized weights should be in model.safetensors and not the transformers_weights
+            self.assertTrue(explicit_transformers_weights not in os.listdir(tmpdirname))
+            self.assertTrue("model.safetensors.index.json" in os.listdir(tmpdirname))
+
+    def test_config_class_attribute(self):
+        # custom configs
+        class MyConfigA(PretrainedConfig):
+            pass
+
+        class MyConfigB(PretrainedConfig):
+            pass
+
+        class MyConfigC(PretrainedConfig):
+            pass
+
+        # custom models
+        class MyModelA(PreTrainedModel):
+            config: dict
+            config_class = MyConfigA
+
+        class MyModelB(MyModelA):
+            config: MyConfigB
+
+        class MyModelC(MyModelA):
+            config_class = MyConfigC
+
+        class MyModelD(MyModelA):
+            pass
+
+        # child config_class > child 'config:' > parent config_class > parent 'config:'
+        self.assertIs(MyModelA.config_class, MyConfigA)
+        self.assertIs(MyModelB.config_class, MyConfigB)
+        self.assertIs(MyModelC.config_class, MyConfigC)
+        self.assertIs(MyModelD.config_class, MyConfigA)
 
 
 @slow
@@ -2478,6 +2548,7 @@ class AttentionMaskTester(unittest.TestCase):
         # non auto-regressive case
         self.check_to_causal(mask_converter, q_len=7, kv_len=7)
 
+    @pytest.mark.torch_compile_test
     def test_torch_compile_fullgraph(self):
         model = Prepare4dCausalAttentionMaskModel()
 
@@ -2621,6 +2692,7 @@ class AttentionMaskTester(unittest.TestCase):
 
 @require_torch
 class TestAttentionImplementation(unittest.TestCase):
+    @unittest.skip("Just a bit annoying")
     def test_error_no_sdpa_available(self):
         with self.assertRaises(ValueError) as cm:
             _ = AutoModel.from_pretrained("hf-tiny-model-private/tiny-random-MCTCTModel", attn_implementation="sdpa")
@@ -2691,17 +2763,6 @@ class TestAttentionImplementation(unittest.TestCase):
 
         self.assertTrue("the package flash_attn seems to be not installed" in str(cm.exception))
 
-    def test_not_available_sdpa(self):
-        if is_torch_sdpa_available():
-            self.skipTest(reason="This test requires torch<=2.0")
-
-        with self.assertRaises(ImportError) as cm:
-            _ = AutoModel.from_pretrained(
-                "hf-internal-testing/tiny-random-GPTBigCodeModel", attn_implementation="sdpa"
-            )
-
-        self.assertTrue("PyTorch SDPA requirements in Transformers are not met" in str(cm.exception))
-
 
 @require_torch
 class TestTensorSharing(TestCasePlus):
@@ -2738,3 +2799,253 @@ class TestTensorSharing(TestCasePlus):
         shared_names, identical_names = _find_identical([{"a", "b"}], state_dict)
         self.assertEqual(shared_names, [{"a", "b"}])
         self.assertEqual(identical_names, [])
+
+
+@require_torch
+class TestSaveAndLoadModelWithExtraState(TestCasePlus):
+    """
+    This test checks that a model can be saved and loaded that uses the torch extra state API.
+    https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.get_extra_state.
+
+    Currently, only tensor-valued extra_states are supported.
+    """
+
+    def test_save_and_load_model_with_tensor_extra_state(self):
+        class MyConfig(PretrainedConfig):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.some_counter = 0
+                self.linear = torch.nn.Linear(320, 320)
+
+            def get_extra_state(self):
+                return torch.tensor(self.some_counter)
+
+            def set_extra_state(self, state):
+                self.some_counter = state.item()
+
+        class MyModel(PreTrainedModel):
+            config_class = MyConfig
+
+            def __init__(self, config: MyConfig):
+                super().__init__(config)
+                self.my_layer = MyModule()
+
+            def forward(self, hidden_states, attention_mask):
+                return self.my_layer(hidden_states, attention_mask)
+
+        config = MyConfig()
+        model = MyModel(config)
+        model.my_layer.some_counter = 42
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname)
+            model = MyModel.from_pretrained(tmpdirname)
+            self.assertEqual(model.my_layer.some_counter, 42)
+
+    @mark.xfail(reason="save and from_pretrained currently only supports tensor extra_state")
+    def test_save_and_load_model_with_dict_extra_state(self):
+        class MyConfig(PretrainedConfig):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+
+        class MyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.some_counter = 0
+                self.linear = torch.nn.Linear(320, 320)
+
+            def get_extra_state(self):
+                return {"some_counter": self.some_counter}
+
+            def set_extra_state(self, state):
+                self.some_counter = state["some_counter"]
+
+        class MyModel(PreTrainedModel):
+            config_class = MyConfig
+
+            def __init__(self, config: MyConfig):
+                super().__init__(config)
+                self.my_layer = MyModule()
+
+            def forward(self, hidden_states, attention_mask):
+                return self.my_layer(hidden_states, attention_mask)
+
+        config = MyConfig()
+        model = MyModel(config)
+        model.my_layer.some_counter = 42
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            model.save_pretrained(tmpdirname)
+            model = MyModel.from_pretrained(tmpdirname)
+            self.assertEqual(model.my_layer.some_counter, 42)
+
+
+class TestGetDecoder(unittest.TestCase):
+    def test_causal_lm_get_decoder_returns_underlying_model(self):
+        cfg = MistralConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+        )
+        model = MistralForCausalLM(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model.model, f"Expected get_decoder() to return model.model, got {type(dec)}"
+
+    def test_seq2seq_get_decoder_still_returns_decoder_module(self):
+        cfg = BartConfig(
+            vocab_size=128,
+            d_model=32,
+            encoder_layers=2,
+            decoder_layers=2,
+            encoder_attention_heads=4,
+            decoder_attention_heads=4,
+            encoder_ffn_dim=64,
+            decoder_ffn_dim=64,
+        )
+        model = BartForConditionalGeneration(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model.model.decoder, "Seq2seq get_decoder() should return the decoder submodule"
+
+    def test_base_model_returns_self(self):
+        """Test that base transformer models (no decoder/model attributes) return self."""
+        cfg = MistralConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+        )
+        base_model = MistralModel(cfg)
+        dec = base_model.get_decoder()
+
+        assert dec is base_model, f"Base model get_decoder() should return self, got {type(dec)}"
+
+    def test_explicit_decoder_attribute_opt(self):
+        """Test models with explicit decoder attribute (OPT style)."""
+        cfg = OPTConfig(
+            vocab_size=128,
+            hidden_size=32,
+            ffn_dim=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=512,
+        )
+        model = OPTForCausalLM(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model.model.decoder, f"OPT get_decoder() should return model.decoder, got {type(dec)}"
+
+    def test_explicit_decoder_attribute_t5(self):
+        """Test encoder-decoder models with explicit decoder attribute."""
+        cfg = T5Config(
+            vocab_size=128,
+            d_model=32,
+            d_ff=64,
+            num_layers=2,
+            num_heads=4,
+        )
+        model = T5ForConditionalGeneration(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model.decoder, f"T5 get_decoder() should return decoder attribute, got {type(dec)}"
+
+    def test_same_type_recursion_prevention(self):
+        """Test that same-type recursion is prevented (see issue #40815)."""
+        cfg = MistralConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+        )
+        model = MistralForCausalLM(cfg)
+
+        assert type(model) is not type(model.model), "Types should be different to prevent recursion"
+
+        dec = model.get_decoder()
+        assert dec is model.model, f"Should return model.model without infinite recursion, got {type(dec)}"
+
+        inner_dec = model.model.get_decoder()
+        assert inner_dec is model.model, f"Inner model should return itself, got {type(inner_dec)}"
+
+    def test_nested_wrapper_recursion(self):
+        """Test models that don't have model/decoder attributes return self."""
+        cfg = GPT2Config(
+            vocab_size=128,
+            n_embd=32,
+            n_layer=2,
+            n_head=4,
+            n_positions=512,
+        )
+        model = GPT2LMHeadModel(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model, f"GPT2 get_decoder() should return self (fallback), got {type(dec)}"
+
+    def test_model_without_get_decoder(self):
+        """Test edge case where model has model attribute but no get_decoder method."""
+
+        class MockInnerModel:
+            """Mock model without get_decoder method."""
+
+            pass
+
+        class MockWrapperModel:
+            """Mock wrapper with model attribute but inner has no get_decoder."""
+
+            def __init__(self):
+                self.model = MockInnerModel()
+
+            def get_decoder(self):
+                if hasattr(self, "decoder"):
+                    return self.decoder
+                if hasattr(self, "model"):
+                    inner = self.model
+                    if hasattr(inner, "get_decoder") and type(inner) is not type(self):
+                        return inner.get_decoder()
+                    return inner
+                return self
+
+        wrapper = MockWrapperModel()
+        dec = wrapper.get_decoder()
+
+        assert dec is wrapper.model, f"Should return inner model when no get_decoder, got {type(dec)}"
+
+    def test_vision_language_model(self):
+        """Test vision-language models like LLaVA that delegate to language_model."""
+        text_config = MistralConfig(
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+        )
+
+        vision_config = {
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_channels": 3,
+            "image_size": 224,
+            "patch_size": 16,
+        }
+
+        cfg = LlavaConfig(
+            text_config=text_config.to_dict(),
+            vision_config=vision_config,
+            vocab_size=128,
+        )
+
+        model = LlavaForConditionalGeneration(cfg)
+        dec = model.get_decoder()
+
+        assert dec is model.language_model, f"LLaVA get_decoder() should return language_model, got {type(dec)}"
