@@ -1163,7 +1163,7 @@ class TrainingArguments:
         },
     )
     dataloader_num_workers: int = field(
-        default=8,
+        default=2,
         metadata={
             "help": (
                 "Number of subprocesses to use for data loading (PyTorch only). 0 means that the data will be loaded"
@@ -1172,7 +1172,7 @@ class TrainingArguments:
         },
     )
     dataloader_prefetch_factor: Optional[int] = field(
-        default=4,
+        default=2,
         metadata={
             "help": (
                 "Number of batches loaded in advance by each worker. "

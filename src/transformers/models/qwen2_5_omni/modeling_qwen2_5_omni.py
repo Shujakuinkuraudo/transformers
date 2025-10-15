@@ -45,7 +45,12 @@ from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, ModelO
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, check_torch_load_is_safe, logging
+from ...utils import (
+    TransformersKwargs,
+    auto_docstring,
+    check_torch_load_is_safe,
+    logging,
+)
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.hub import cached_file
 from ..qwen2.modeling_qwen2 import Qwen2RMSNorm
@@ -60,6 +65,7 @@ from .configuration_qwen2_5_omni import (
     Qwen2_5OmniToken2WavConfig,
     Qwen2_5OmniVisionEncoderConfig,
 )
+import os
 
 
 if is_flash_attn_available():
@@ -820,7 +826,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
@@ -842,8 +850,12 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+        query.dtype
+    )
+    attn_weights = nn.functional.dropout(
+        attn_weights, p=dropout, training=module.training
+    )
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -909,8 +921,10 @@ class Qwen2_5OmniAudioAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
+
         attn_output, _ = attention_interface(
             self,
             query_states,
@@ -998,8 +1012,12 @@ class SinusoidsPositionEmbedding(nn.Module):
         if channels % 2 != 0:
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
         log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
-        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
-        scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+        inv_timescales = torch.exp(
+            -log_timescale_increment * torch.arange(channels // 2).float()
+        )
+        scaled_time = (
+            torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+        )
         self.register_buffer(
             "positional_embedding",
             torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1),
@@ -1058,7 +1076,9 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
     def set_input_embeddings(self, value: nn.Module):
         self.conv1 = value
 
-    def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def _prepare_attention_mask(
+        self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> torch.Tensor:
         # Flash Attention 2 doesn't need a 4D mask and relies on `cu_seqlens/max_seqlen`
         # NOTE: the created attention masl only approximates the ragged FA2 attention by
         # allowing bidirectional attention within `cu_seqlens` blocks, and not attending between
@@ -1074,7 +1094,11 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             dtype=inputs_tensor.dtype,
         )
         for i in range(1, len(cu_seqlens)):
-            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
+            attention_mask[
+                ...,
+                cu_seqlens[i - 1] : cu_seqlens[i],
+                cu_seqlens[i - 1] : cu_seqlens[i],
+            ] = 0
         return attention_mask
 
     @auto_docstring
@@ -1143,7 +1167,7 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
 
         # print(hidden_states.shape, f"{feature_lens=}, {aftercnn_lens=}, {feature_lens.shape=}, {aftercnn_lens.shape=}")
         # torch.Size([935, 1280]) feature_lens=tensor([1038,  832], device='cuda:1'), aftercnn_lens=tensor([519, 416], device='cuda:1'), feature_lens.shape=torch.Size([2]), aftercnn_lens.shape=torch.Size([2])
-        
+
         for idx, encoder_layer in enumerate(self.layers):
             layer_outputs = encoder_layer(
                 hidden_states,
@@ -1158,10 +1182,10 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             if os.environ.get("GET_FEATURE", "0") == "1":
                 for i in range(len(aftercnn_lens)):
                     accumulated_len = aftercnn_lens[:i].sum()
-                    if idx % 5 == 0:
+                    if idx in [5, 15, 23]:
                         hidden_states_dict[i][idx + 1] = (
                             layer_outputs[0][
-                                accumulated_len: accumulated_len + aftercnn_lens[i]
+                                accumulated_len : accumulated_len + aftercnn_lens[i]
                             ]
                             .clone()
                             .detach()
@@ -1206,6 +1230,24 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                     "wb",
                 ) as f:
                     pickle.dump(output_dict, f)
+
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/metadata.txt",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write("============================\n")
+                    f.write("Audio Encoder Features\n")
+                    for key in output_dict["features"].keys():
+                        f.write(
+                            f"{key} {type(output_dict['features'][key])} {output_dict['features'][key].shape}\n"
+                        )
+                    f.write("\n")
+                    for key in output_dict.keys():
+                        if key != "features":
+                            f.write(
+                                f"{key} {type(output_dict[key])} {output_dict[key].shape}\n"
+                            )
 
         token_audio = torch.cat(token_audio_list, dim=0)
         return BaseModelOutput(last_hidden_state=token_audio)
@@ -1306,11 +1348,21 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        query_states = self.q(hidden_states, task_ids=task_ids).reshape(seq_length, self.num_heads, -1)
-        key_states = self.k(hidden_states, task_ids=task_ids).reshape(seq_length, self.num_heads, -1)
-        value_states = self.v(hidden_states, task_ids=task_ids).reshape(seq_length, self.num_heads, -1)
-        query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
+        query_states = self.q(hidden_states, task_ids=task_ids).reshape(
+            seq_length, self.num_heads, -1
+        )
+        key_states = self.k(hidden_states, task_ids=task_ids).reshape(
+            seq_length, self.num_heads, -1
+        )
+        value_states = self.v(hidden_states, task_ids=task_ids).reshape(
+            seq_length, self.num_heads, -1
+        )
+        query_states = apply_rotary_pos_emb_vision(
+            query_states.unsqueeze(0), rotary_pos_emb
+        ).squeeze(0)
+        key_states = apply_rotary_pos_emb_vision(
+            key_states.unsqueeze(0), rotary_pos_emb
+        ).squeeze(0)
 
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
@@ -1318,7 +1370,9 @@ class Qwen2_5OmniVisionAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
 
         if self.config._attn_implementation == "flash_attention_2":
             # Flash Attention 2: Use cu_seqlens for variable length attention
@@ -1341,7 +1395,8 @@ class Qwen2_5OmniVisionAttention(nn.Module):
         else:
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+                torch.split(tensor, lengths.tolist(), dim=2)
+                for tensor in (query_states, key_states, value_states)
             ]
 
             attn_outputs = [
@@ -1360,8 +1415,6 @@ class Qwen2_5OmniVisionAttention(nn.Module):
             ]
             attn_output = torch.cat(attn_outputs, dim=1)
 
-
- 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
         return attn_output
@@ -1606,7 +1659,7 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        grid_thw: torch.Tensor, 
+        grid_thw: torch.Tensor,
         task_ids: Optional[torch.Tensor] = None,
         original_hashs: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1682,12 +1735,12 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
                 rotary_pos_emb=rotary_pos_emb,
-                **kwargs
+                **kwargs,
             )
 
             if os.environ.get("GET_FEATURE", "0") == "1":
                 for i in range(len(grid_thw)):
-                    if layer_num % 5 == 0:
+                    if layer_num in [5, 15, 23]:
                         end_idx = torch.cumsum(torch.tensor(accumulate_size), dim=0)[i]
                         visual_feature_dict[i][layer_num + 1] = (
                             hidden_states[end_idx - accumulate_size[i] : end_idx]
@@ -1731,6 +1784,24 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
                     "wb",
                 ) as f:
                     pickle.dump(output_dict, f)
+
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/metadata.txt",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write("================================\n")
+                    f.write("Vision Shape Info\n")
+                    for key in output_dict["features"].keys():
+                        f.write(
+                            f"{key} {type(output_dict['features'][key])} {output_dict['features'][key].shape}\n"
+                        )
+                    f.write("\n")
+                    for key in output_dict.keys():
+                        if key != "features":
+                            f.write(
+                                f"{key} {type(output_dict[key])} {output_dict[key].shape}\n"
+                            )
                     # original_hash <class 'torch.Tensor'> torch.Size([])
                     # grid_thw <class 'torch.Tensor'> torch.Size([3])
                     #    0 <class 'torch.Tensor'> torch.Size([1680, 1280])
@@ -1870,11 +1941,23 @@ class Qwen2_5OmniAttention(nn.Module):
         self.rope_scaling = config.rope_scaling
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+        self.sliding_window = (
+            config.sliding_window
+            if config.layer_types[layer_idx] == "sliding_attention"
+            else None
+        )
 
         self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
 
@@ -1910,12 +1993,20 @@ class Qwen2_5OmniAttention(nn.Module):
         )
 
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": cache_position,
+            }  # Specific to RoPE models
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -1972,7 +2063,9 @@ class Qwen2_5OmniDecoderLayer(GradientCheckpointingLayer):
 
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.attention_type = config.layer_types[layer_idx]
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -1985,9 +2078,13 @@ class Qwen2_5OmniDecoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> tuple[
+        torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -2086,6 +2183,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         task_ids: Optional[torch.Tensor] = None,
+        original_hashs: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
         output_attentions = (
@@ -2135,7 +2233,9 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+            position_ids = cache_position.view(1, 1, -1).expand(
+                3, inputs_embeds.shape[0], -1
+            )
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -2172,7 +2272,9 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                causal_mask_mapping["sliding_attention"] = (
+                    create_sliding_window_causal_mask(**mask_kwargs)
+                )
 
         hidden_states = inputs_embeds
 
@@ -2183,10 +2285,12 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            output_dict = [{} for i in range(inputs_embeds.shape[0])]
+
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
 
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -2202,9 +2306,48 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             )
 
             hidden_states = layer_outputs[0]
+            
+            if os.environ.get("GET_FEATURE", "0") == "1":
+                if i % 3 == 0:
+                    for j in range(inputs_embeds.shape[0]):
+                        output_dict[j][i] = (
+                            hidden_states[j]
+                            .clone()
+                            .detach()
+                            .cpu()
+                        )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+            
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            for j in range(inputs_embeds.shape[0]):
+                output_dict[j]["final"] = (
+                    hidden_states[j]
+                    .clone()
+                    .detach()
+                    .cpu()
+                )
+                import pickle
+
+
+                with open(
+                    f"features/{task_ids[j]}/{original_hashs[j]}/llmfeature.pkl",
+                    "wb",
+                ) as f:
+                    pickle.dump(output_dict[j], f)
+
+                with open(
+                    f"features/{task_ids[j]}/{original_hashs[j]}/metadata.txt",
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write("================================\n")
+                    f.write("Feature in llm Shape Info\n")
+                    for key in output_dict[j].keys():
+                        f.write(
+                            f"{key} {type(output_dict[j][key])} {output_dict[j][key].shape}\n"
+                        )
 
         hidden_states = self.norm(hidden_states)
 
@@ -2214,7 +2357,14 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
 
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None
+                v
+                for v in [
+                    hidden_states,
+                    past_key_values,
+                    all_hidden_states,
+                    all_self_attns,
+                ]
+                if v is not None
             )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -2229,7 +2379,9 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
     The Qwen2.5OmniThinker model which consists of a audio backbone and a language model.
     """
 )
-class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin):
+class Qwen2_5OmniThinkerForConditionalGeneration(
+    Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin
+):
     config: Qwen2_5OmniThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
@@ -2241,8 +2393,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
         self.vocab_size = config.text_config.vocab_size
         self.model = Qwen2_5OmniThinkerTextModel._from_config(config.text_config)
-        self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self.lm_head = nn.Linear(
+            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
+        )
+        self.pad_token_id = (
+            self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        )
         self.spatial_merge_size = config.vision_config.spatial_merge_size
         self.rope_deltas = None
         self.post_init()
@@ -2254,8 +2410,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.model.set_input_embeddings(value)
 
     def get_video_features(
-        self, pixel_values_videos: torch.FloatTensor, video_grid_thw: Optional[torch.LongTensor] = None,
-        task_ids: Optional[torch.Tensor] = None, original_hashs: Optional[torch.Tensor] = None
+        self,
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        task_ids: Optional[torch.Tensor] = None,
+        original_hashs: Optional[torch.Tensor] = None,
     ):
         """
         Encodes videos into continuous embeddings that can be forwarded to the language model.
@@ -2267,7 +2426,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 The temporal, height and width of feature shape of each video in LLM.
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-        video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw, task_ids=task_ids, original_hashs=original_hashs)
+        video_embeds = self.visual(
+            pixel_values_videos,
+            grid_thw=video_grid_thw,
+            task_ids=task_ids,
+            original_hashs=original_hashs,
+        )
         return video_embeds
 
     def get_image_features(
@@ -2287,7 +2451,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual.forward(pixel_values, grid_thw=image_grid_thw, task_ids=task_ids, original_hashs=original_hashs)
+        image_embeds = self.visual.forward(
+            pixel_values,
+            grid_thw=image_grid_thw,
+            task_ids=task_ids,
+            original_hashs=original_hashs,
+        )
         return image_embeds
 
     def get_audio_features(
@@ -2311,14 +2480,24 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         """
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+            input_features = input_features.permute(0, 2, 1)[
+                feature_attention_mask.bool()
+            ].permute(1, 0)
         else:
             audio_feature_lengths = None
 
-        audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-            audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        audio_feat_lengths, audio_output_lengths = (
+            self.audio_tower._get_feat_extract_output_lengths(
+                audio_feature_lengths
+                if audio_feature_lengths is not None
+                else feature_attention_mask.sum(-1)
+            )
         )
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+        feature_lens = (
+            audio_feature_lengths
+            if audio_feature_lengths is not None
+            else feature_attention_mask.sum(-1)
+        )
         audio_outputs = self.audio_tower.forward(
             input_features,
             feature_lens=feature_lens,
@@ -2329,7 +2508,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         audio_features = audio_outputs.last_hidden_state
 
         if audio_features.shape[0] != sum(audio_output_lengths.tolist()):
-            raise ValueError("length of audio_features should match audio_output_lengths")
+            raise ValueError(
+                "length of audio_features should match audio_output_lengths"
+            )
 
         return audio_features
 
@@ -2346,17 +2527,29 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         """
         if input_ids is None:
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+                torch.tensor(
+                    self.config.image_token_id,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
+                )
             )
             special_image_mask = special_image_mask.all(-1)
             special_video_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.video_token_id, dtype=torch.long, device=inputs_embeds.device)
+                torch.tensor(
+                    self.config.video_token_id,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
+                )
             )
             special_video_mask = special_video_mask.all(-1)
             special_audio_mask = (
                 inputs_embeds
                 == self.get_input_embeddings()(
-                    torch.tensor(self.config.audio_token_id, dtype=torch.long, device=inputs_embeds.device)
+                    torch.tensor(
+                        self.config.audio_token_id,
+                        dtype=torch.long,
+                        device=inputs_embeds.device,
+                    )
                 )
             ).all(-1)
         else:
@@ -2365,20 +2558,38 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             special_audio_mask = input_ids == self.config.audio_token_id
 
         n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+        special_image_mask = (
+            special_image_mask.unsqueeze(-1)
+            .expand_as(inputs_embeds)
+            .to(inputs_embeds.device)
+        )
+        if (
+            image_features is not None
+            and inputs_embeds[special_image_mask].numel() != image_features.numel()
+        ):
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
             )
 
         n_video_tokens = special_video_mask.sum()
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-        if video_features is not None and inputs_embeds[special_video_mask].numel() != video_features.numel():
+        special_video_mask = (
+            special_video_mask.unsqueeze(-1)
+            .expand_as(inputs_embeds)
+            .to(inputs_embeds.device)
+        )
+        if (
+            video_features is not None
+            and inputs_embeds[special_video_mask].numel() != video_features.numel()
+        ):
             raise ValueError(
                 f"Videos features and image tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
             )
 
-        special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        special_audio_mask = (
+            special_audio_mask.unsqueeze(-1)
+            .expand_as(inputs_embeds)
+            .to(inputs_embeds.device)
+        )
         return special_image_mask, special_video_mask, special_audio_mask
 
     @auto_docstring
@@ -2492,12 +2703,21 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 task_ids=task_ids,
                 original_hashs=original_hashs,
             )
-            audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, _, audio_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds)
+            audio_features = audio_features.to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            _, _, audio_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds
+            )
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
         if pixel_values is not None:
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw, task_ids=task_ids, original_hashs=original_hashs)
+            image_embeds = self.get_image_features(
+                pixel_values,
+                image_grid_thw,
+                task_ids=task_ids,
+                original_hashs=original_hashs,
+            )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -2505,13 +2725,18 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, task_ids=task_ids, original_hashs=original_hashs)
+            video_embeds = self.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                task_ids=task_ids,
+                original_hashs=original_hashs,
+            )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-        
+
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         else:
@@ -2546,6 +2771,42 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        if os.environ.get("GET_FEATURE", "0") == "1":
+            llm_mask = (
+                (input_ids != 151655)  # image_token_index
+                & (input_ids != 151643) # pad_token_id
+                & (input_ids != 151646) # audio_token_index
+                & (input_ids != 151656)  # vision_start_token_id
+            )
+            image_mask = input_ids == 151655
+            audio_mask = input_ids == 151646
+            video_mask = input_ids == 151656
+
+            for i in range(inputs_embeds.size(0)):
+                import pickle
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/embed.pkl",
+                    "wb",
+                ) as f:
+                    output_dict = {}
+                    output_dict["llm"] = inputs_embeds[i][llm_mask[i]].detach().cpu()
+                    output_dict["image"] = inputs_embeds[i][image_mask[i]].detach().cpu()
+                    output_dict["audio"] = inputs_embeds[i][audio_mask[i]].detach().cpu()
+                    output_dict["video"] = inputs_embeds[i][video_mask[i]].detach().cpu()
+                    output_dict["all"] = inputs_embeds[i].detach().cpu()
+                    output_dict["token"] = input_ids[i].detach().cpu()
+                    pickle.dump(output_dict, f)
+
+                with open(
+                    f"features/{task_ids[i]}/{original_hashs[i]}/metadata.txt", "a", encoding="utf-8"
+                ) as f:
+                    f.write("========================\n")
+                    f.write("Embedding Shapes:\n")
+                    f.write(
+                        f"llm: {inputs_embeds[i][llm_mask[i]].shape}, image: {inputs_embeds[i][image_mask[i]].shape}, audio: {inputs_embeds[i][audio_mask[i]].shape}, video: {inputs_embeds[i][video_mask[i]].shape}, token: {input_ids[i].shape}, all: {inputs_embeds[i].shape}\n"
+                    )
+
 
 
         if hasattr(self, "dmole_router"):
@@ -2608,6 +2869,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            task_ids=task_ids,
+            original_hashs=original_hashs,
             **kwargs,
         )
 
@@ -2775,7 +3038,11 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -2818,7 +3085,9 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+            position_ids = cache_position.view(1, 1, -1).expand(
+                3, inputs_embeds.shape[0], -1
+            )
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -2855,7 +3124,9 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                causal_mask_mapping["sliding_attention"] = (
+                    create_sliding_window_causal_mask(**mask_kwargs)
+                )
 
         hidden_states = inputs_embeds
 
@@ -2895,7 +3166,14 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
 
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, past_key_values, all_hidden_states, all_self_attns] if v is not None
+                v
+                for v in [
+                    hidden_states,
+                    past_key_values,
+                    all_hidden_states,
+                    all_self_attns,
+                ]
+                if v is not None
             )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -2905,7 +3183,9 @@ class Qwen2_5OmniTalkerModel(Qwen2_5OmniPreTrainedModel):
         )
 
 
-class Qwen2_5OmniTalkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin):
+class Qwen2_5OmniTalkerForConditionalGeneration(
+    Qwen2_5OmniPreTrainedModelForConditionalGeneration, GenerationMixin
+):
     config: Qwen2_5OmniTalkerConfig
     base_model_prefix = "talker"
 
@@ -4758,7 +5038,9 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             return thinker_result
 
         # 2. Generate speech tokens from talker module
-        embeds_to_talker = thinker_result.hidden_states[0][0].clone().to(input_ids.device)
+        embeds_to_talker = (
+            thinker_result.hidden_states[0][0].clone().to(input_ids.device)
+        )
         if thinker_kwargs.get("input_features") is not None:
             audio_ids_mask = input_ids == self.config.thinker_config.audio_token_index
             audio_mask = audio_ids_mask.unsqueeze(-1).expand_as(embeds_to_talker)
@@ -4790,19 +5072,25 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         processed_thinker_hidden = (
             (embeds_to_talker,) + thinker_result.hidden_states[0][1:],
         ) + thinker_result.hidden_states[1:]
-        thinker_generate_ids = thinker_result.sequences[:, input_ids.size(1) :].to(input_ids.device)
+        thinker_generate_ids = thinker_result.sequences[:, input_ids.size(1) :].to(
+            input_ids.device
+        )
         thinker_token_embeds = [
-            token_hidden_states[0].to(input_ids.device) for token_hidden_states in processed_thinker_hidden
+            token_hidden_states[0].to(input_ids.device)
+            for token_hidden_states in processed_thinker_hidden
         ]
         thinker_hidden_states = [
-            token_hidden_states[-1].to(input_ids.device) for token_hidden_states in processed_thinker_hidden
+            token_hidden_states[-1].to(input_ids.device)
+            for token_hidden_states in processed_thinker_hidden
         ]
 
         talker_text_bos_token = speaker_params["bos_token"]
         talker_input_text_ids = torch.cat(
             [
                 input_ids,
-                torch.tensor([[talker_text_bos_token]], dtype=torch.long, device=input_ids.device),
+                torch.tensor(
+                    [[talker_text_bos_token]], dtype=torch.long, device=input_ids.device
+                ),
                 thinker_generate_ids[:, :1],
             ],
             dim=-1,
@@ -4811,8 +5099,16 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         talker_input_ids = torch.cat(
             [
                 torch.full_like(input_ids, fill_value=self.talker.codec_mask_token),
-                torch.tensor([[self.talker.codec_pad_token]], dtype=torch.long, device=input_ids.device),
-                torch.tensor([[self.talker.codec_bos_token]], dtype=torch.long, device=input_ids.device),
+                torch.tensor(
+                    [[self.talker.codec_pad_token]],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+                torch.tensor(
+                    [[self.talker.codec_bos_token]],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
             ],
             dim=1,
         )
@@ -4822,8 +5118,12 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             thinker_token_embeds[1:], dim=1
         )
         talker_inputs_embeds = thinker_hidden_states[0] + thinker_token_embeds[0]
-        talker_text_bos_token = torch.tensor([[talker_text_bos_token]], dtype=torch.long, device=input_ids.device)
-        talker_text_bos_embed = thinker_embed_tokens(talker_text_bos_token).to(input_ids.device)
+        talker_text_bos_token = torch.tensor(
+            [[talker_text_bos_token]], dtype=torch.long, device=input_ids.device
+        )
+        talker_text_bos_embed = thinker_embed_tokens(talker_text_bos_token).to(
+            input_ids.device
+        )
         talker_inputs_embeds = torch.cat(
             [
                 talker_inputs_embeds,
@@ -4834,11 +5134,19 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         )
 
         eos_embedding = thinker_embed_tokens(
-            torch.tensor([[self.talker.text_eos_token]], dtype=torch.long, device=input_ids.device)
+            torch.tensor(
+                [[self.talker.text_eos_token]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
         )
 
         pad_embedding = thinker_embed_tokens(
-            torch.tensor([[self.talker.text_pad_token]], dtype=torch.long, device=input_ids.device)
+            torch.tensor(
+                [[self.talker.text_pad_token]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
         )
 
         thinker_reply_part = torch.cat(
@@ -4853,7 +5161,8 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
         talker_attention_mask = None
         if "attention_mask" in kwargs:
             talker_attention_mask = torch.cat(
-                [kwargs["attention_mask"], kwargs["attention_mask"].new_ones((1, 2))], dim=1
+                [kwargs["attention_mask"], kwargs["attention_mask"].new_ones((1, 2))],
+                dim=1,
             ).to(input_ids.device)
 
         talker_result = self.talker.generate(
@@ -4863,7 +5172,10 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
             inputs_embeds=talker_inputs_embeds,
             attention_mask=talker_attention_mask,
             suppress_tokens=[self.talker.codec_bos_token],
-            **{k: (v.to(input_ids.device) if torch.is_tensor(v) else v) for k, v in talker_kwargs.items()},
+            **{
+                k: (v.to(input_ids.device) if torch.is_tensor(v) else v)
+                for k, v in talker_kwargs.items()
+            },
         )
         talker_generate_codes = talker_result[:, talker_input_ids.shape[1] : -1]
 
