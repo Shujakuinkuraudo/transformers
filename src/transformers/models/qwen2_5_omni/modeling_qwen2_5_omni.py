@@ -2308,7 +2308,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
             hidden_states = layer_outputs[0]
             
             if os.environ.get("GET_FEATURE", "0") == "1":
-                if i % 3 == 0:
+                if i % 3 == 0 and i < 10:
                     for j in range(inputs_embeds.shape[0]):
                         output_dict[j][i] = (
                             hidden_states[j]
