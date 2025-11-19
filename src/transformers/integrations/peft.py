@@ -294,6 +294,7 @@ class PeftAdapterMixin:
 
             if err_msg:
                 logger.warning(err_msg)
+                print(err_msg)
 
         if peft_config.inference_mode:
             self.eval()

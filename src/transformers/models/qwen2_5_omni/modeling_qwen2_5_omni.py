@@ -1236,7 +1236,7 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                     "a",
                     encoding="utf-8",
                 ) as f:
-                    f.write("============================\n")
+                    f.write("===========audio.pkl=================\n")
                     f.write("Audio Encoder Features\n")
                     for key in output_dict["features"].keys():
                         f.write(
@@ -1790,7 +1790,7 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
                     "a",
                     encoding="utf-8",
                 ) as f:
-                    f.write("================================\n")
+                    f.write("===============visual.pkl=================\n")
                     f.write("Vision Shape Info\n")
                     for key in output_dict["features"].keys():
                         f.write(
@@ -2342,7 +2342,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
                     "a",
                     encoding="utf-8",
                 ) as f:
-                    f.write("================================\n")
+                    f.write("==============llmfeature.pkl==================\n")
                     f.write("Feature in llm Shape Info\n")
                     for key in output_dict[j].keys():
                         f.write(
@@ -2801,7 +2801,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 with open(
                     f"features/{task_ids[i]}/{original_hashs[i]}/metadata.txt", "a", encoding="utf-8"
                 ) as f:
-                    f.write("========================\n")
+                    f.write("========== embed.pkl ==============\n")
                     f.write("Embedding Shapes:\n")
                     f.write(
                         f"llm: {inputs_embeds[i][llm_mask[i]].shape}, image: {inputs_embeds[i][image_mask[i]].shape}, audio: {inputs_embeds[i][audio_mask[i]].shape}, video: {inputs_embeds[i][video_mask[i]].shape}, token: {input_ids[i].shape}, all: {inputs_embeds[i].shape}\n"
